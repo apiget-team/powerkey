@@ -30,6 +30,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Restricted 执行策略下脚本内 npm(npm.ps1) 调用会失败；仅当前进程放行（安全，不改系统策略）
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue } catch {}
 
 # -------- 常量 --------
 $PowerkeyVersion = '0.1.0'
@@ -50,6 +52,10 @@ $LocalBin        = Join-Path $HOME '.local\bin'
 $CcSwitchDir     = Join-Path $HOME '.cc-switch'
 $CcSwitchDb      = Join-Path $CcSwitchDir 'cc-switch.db'
 $CcSwitchSettings = Join-Path $CcSwitchDir 'settings.json'
+
+# 归一化用户覆盖的 URL（补 scheme、去尾斜杠），避免 ANTHROPIC_BASE_URL 配错
+if ($BaseUrl) { if ($BaseUrl -notmatch '^https?://') { $BaseUrl = "https://$BaseUrl" }; $BaseUrl = $BaseUrl.TrimEnd('/') }
+if ($Issuer)  { if ($Issuer  -notmatch '^https?://') { $Issuer  = "https://$Issuer"  }; $Issuer  = $Issuer.TrimEnd('/') }
 
 # -------- 日志 --------
 function Info($m) { Write-Host "▸ $m" -ForegroundColor Cyan }
@@ -108,7 +114,11 @@ function Test-ConflictingEnv {
 
 # 没有 Node 时从国内镜像装（解压到 ~/.powerkey/node，加入本次+User PATH）
 function Install-NodeCn {
-  if (Test-Cmd npm) { return }
+  if ((Test-Cmd npm) -and (Test-Cmd node)) {
+    $nv = (& node -v 2>$null)
+    if ($nv -match 'v(\d+)\.' -and [int]$Matches[1] -ge 18) { return }
+    Warn "Node 版本过低（$nv，需 ≥18），改用国内镜像 Node ${NodeVer}…"
+  }
   $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
   $name = "node-$NodeVer-win-$arch"
   $url  = "$NodeCnMirror/$NodeVer/$name.zip"
@@ -150,6 +160,11 @@ function Install-ClaudeCode {
   } else {
     try { irm $ClaudeInstall | iex; if (-not (Get-ClaudeExe)) { throw '官方源未生成 claude' } }
     catch { Warn "官方源安装失败（可能国内网络），改用国内镜像 npmmirror…"; Install-ClaudeCn }
+  }
+  $exe2 = Get-ClaudeExe
+  if ($exe2) {
+    $ok2 = $false; try { & $exe2 --version *>$null; $ok2 = ($LASTEXITCODE -eq 0) } catch { $ok2 = $false }
+    if (-not $ok2) { Warn 'claude 已装但 --version 跑不通（镜像可能缺平台二进制）；可重试或把 -Cn 与官方源互换一次。' }
   }
   Ok 'Claude Code 安装完成。'
 }
@@ -202,7 +217,7 @@ function Set-Settings($base, $token, $model) {
     Write-Host "    ANTHROPIC_BASE_URL=$base"
     Write-Host "    ANTHROPIC_AUTH_TOKEN=$($token.Substring(0,[Math]::Min(6,$token.Length)))****"
     Write-Host "    ANTHROPIC_MODEL=$model ; ANTHROPIC_DEFAULT_HAIKU_MODEL=$model"
-    Write-Host "    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ; DISABLE_TELEMETRY=1 ; DISABLE_ERROR_REPORTING=1 ; CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+    Write-Host "    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ; API_TIMEOUT_MS=600000 ; DISABLE_TELEMETRY=1 ; DISABLE_ERROR_REPORTING=1 ; CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ; DISABLE_AUTOUPDATER=1"
     return
   }
   New-Item -ItemType Directory -Force -Path $ClaudeDir | Out-Null
@@ -221,6 +236,8 @@ function Set-Settings($base, $token, $model) {
   $obj.env.DISABLE_TELEMETRY                           = '1'
   $obj.env.DISABLE_ERROR_REPORTING                     = '1'
   $obj.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC    = '1'
+  $obj.env.API_TIMEOUT_MS                              = '600000'
+  $obj.env.DISABLE_AUTOUPDATER                         = '1'
   ($obj | ConvertTo-Json -Depth 20) | Set-Content -Path $SettingsFile -Encoding UTF8
   Ok "已写入 ${SettingsFile}（合并保留你的其它设置）。"
 }
@@ -240,8 +257,8 @@ import sqlite3, json, os, time
 db = os.environ["PK_DB"]; setp = os.environ["PK_SET"]
 env = {"ANTHROPIC_BASE_URL": os.environ["PK_B"], "ANTHROPIC_AUTH_TOKEN": os.environ["PK_T"],
        "ANTHROPIC_MODEL": os.environ["PK_M"], "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.environ["PK_M"],
-       "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "DISABLE_TELEMETRY": "1",
-       "DISABLE_ERROR_REPORTING": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+       "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "API_TIMEOUT_MS": "600000", "DISABLE_TELEMETRY": "1",
+       "DISABLE_ERROR_REPORTING": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1"}
 sc = json.dumps({"env": env}, ensure_ascii=False)
 con = sqlite3.connect(db, timeout=5); cur = con.cursor()
 cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='providers'")
@@ -269,7 +286,8 @@ function Show-Ready($base, $model, $quota) {
   Ok '就绪！'
   Write-Host "  额度：`$$quota 体验额度    默认模型：$model    中转：$base"
   Write-Host ''
-  Write-Host "  想试更强的模型？对话里输入 /model 可切 Claude / Gemini 等（已开网关模型发现）。" -ForegroundColor DarkGray
+  Write-Host "  已配好 apiget 中转，无需登录 Anthropic 账号（别走 /login），直接对话即可。" -ForegroundColor DarkGray
+  Write-Host "  进对话后输入 /status 确认中转已生效；/model 可切 Claude / Gemini 等（已开网关模型发现）。" -ForegroundColor DarkGray
   Write-Host "  想长期用 / 要更多额度？注册：$RegisterUrl" -ForegroundColor DarkGray
   Write-Host ''
 }
@@ -285,7 +303,7 @@ function Invoke-Uninstall {
     try {
       $obj = ConvertTo-HashtableDeep (Get-Content $SettingsFile -Raw | ConvertFrom-Json)
       if ($obj.env -is [hashtable]) {
-        foreach ($k in 'ANTHROPIC_BASE_URL','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL','CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY','DISABLE_TELEMETRY','DISABLE_ERROR_REPORTING','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC') { $obj.env.Remove($k) }
+        foreach ($k in 'ANTHROPIC_BASE_URL','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL','CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY','API_TIMEOUT_MS','DISABLE_TELEMETRY','DISABLE_ERROR_REPORTING','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC','DISABLE_AUTOUPDATER') { $obj.env.Remove($k) }
       }
       ($obj | ConvertTo-Json -Depth 20) | Set-Content -Path $SettingsFile -Encoding UTF8
       Ok '已移除 powerkey 写入的 env 键。'
@@ -293,6 +311,30 @@ function Invoke-Uninstall {
   }
   Remove-Item $StateFile -ErrorAction SilentlyContinue
   Ok '完成。（未卸载 Claude Code 本身。）'
+}
+
+# 预置 ~/.claude.json 跳过首启向导（主题/信任目录/项目向导）。用 node（装完必有）忠实合并，
+# 不拿 PowerShell 转换冒险污染这个 CC 大状态文件；无 node 则跳过（不影响使用）。
+function Skip-Onboarding {
+  if ($DryRun) { Info '[dry-run] 将标记 ~/.claude.json 跳过首启向导（主题/信任目录）。'; return }
+  $cj = Join-Path $HOME '.claude.json'
+  New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
+  if (Test-Path $cj) { Copy-Item $cj (Join-Path $BackupDir ("claude.json.bak." + (Get-Date -Format yyyyMMddHHmmss))) -ErrorAction SilentlyContinue }
+  if (Test-Cmd node) {
+    $env:PK_CJ = $cj; $env:PK_CWD = (Get-Location).Path
+    $js = @'
+const fs=require("fs"),p=process.env.PK_CJ,cwd=process.env.PK_CWD;
+let d={}; try{d=JSON.parse(fs.readFileSync(p,"utf8"))||{}}catch(e){}
+if(typeof d!=="object"||!d)d={};
+d.hasCompletedOnboarding=true;
+if(typeof d.projects!=="object"||!d.projects)d.projects={};
+const pr=(typeof d.projects[cwd]==="object"&&d.projects[cwd])?d.projects[cwd]:{};
+pr.hasTrustDialogAccepted=true; pr.hasCompletedProjectOnboarding=true; d.projects[cwd]=pr;
+fs.writeFileSync(p, JSON.stringify(d,null,2));
+'@
+    try { $js | & node - ; if ($LASTEXITCODE -eq 0) { Ok '已跳过首启向导（主题/信任目录），落地即对话。'; return } } catch {}
+  }
+  Warn '未能预置跳过首启向导（不影响使用，首次 claude 手动选一次主题/信任目录即可）。'
 }
 
 # -------- main --------
@@ -303,6 +345,7 @@ Install-ClaudeCode
 $t = Get-IssuedToken
 Set-Settings $t.base $t.token $t.model
 Set-CcSwitch $t.base $t.token $t.model
+Skip-Onboarding
 Show-Ready $t.base $t.model $t.quota
 
 if (-not $DryRun -and -not $NoLaunch) {

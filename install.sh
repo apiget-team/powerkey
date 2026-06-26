@@ -134,6 +134,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$REF" ] && [ -z "$CHANNEL" ] && CHANNEL="$REF"   # --ref 是 --channel 的别名
+# 归一化用户覆盖的 URL（补 scheme、去尾斜杠），避免 ANTHROPIC_BASE_URL 配错
+[ -n "$BASE_URL" ] && { BASE_URL="$(ensure_scheme "$BASE_URL")"; BASE_URL="${BASE_URL%/}"; }
+[ -n "$ISSUER" ]   && { ISSUER="$(ensure_scheme "$ISSUER")"; ISSUER="${ISSUER%/}"; }
 
 # -------- 工具 --------
 detect_os()   { case "$(uname -s 2>/dev/null || echo unknown)" in Darwin) echo darwin;; Linux) echo linux;; *) echo unknown;; esac; }
@@ -237,7 +240,14 @@ ensure_local_bin_path() {
 
 # 没有 Node 时，从国内镜像下一个（免 sudo、免 GitHub），软链 node/npm 进 ~/.local/bin
 ensure_node_cn() {
-  has_cmd npm && return 0
+  # 已有 npm 且 Node 主版本 ≥18 才跳过；旧 Node 会让 CC 启动 EBADENGINE/SyntaxError，需引导新 Node
+  if has_cmd npm && has_cmd node; then
+    local _maj; _maj="$(node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
+    case "$_maj" in
+      ''|*[!0-9]*) : ;;
+      *) [ "$_maj" -ge 18 ] && return 0; warn "Node 版本过低（$(node -v 2>/dev/null)，需 ≥18），改用国内镜像 Node ${NODE_VER}…" ;;
+    esac
+  fi
   local os arch nodeos nodearch dir pkg url
   os="$(detect_os)"; arch="$(detect_arch)"
   case "$os" in darwin) nodeos=darwin ;; linux) nodeos=linux ;; *) die "不支持的系统自动装 Node。" ;; esac
@@ -291,7 +301,12 @@ ensure_claude_code() {
   if [ "$DRY_RUN" = 1 ]; then ok "[dry-run] 将安装 Claude Code（CN=${CN}：1=国内镜像 npmmirror；0=官方源失败再回退国内镜像）"; return 0; fi
   if [ "$CN" = 1 ]; then cc_install_cn; else cc_install_native_or_cn; fi
   ensure_local_bin_path
-  [ -n "$(claude_path)" ] || warn "已安装但 PATH 未含 claude；新开终端，或把 ${LOCAL_BIN} 加入 PATH。"
+  local _cb; _cb="$(claude_path)"
+  [ -n "$_cb" ] || warn "已安装但 PATH 未含 claude；新开终端，或把 ${LOCAL_BIN} 加入 PATH。"
+  # 装后冒烟：确认二进制真能跑（防 npmmirror 平台二进制不全等静默坏）
+  if [ -n "$_cb" ] && ! "$_cb" --version >/dev/null 2>&1; then
+    warn "claude 已装但 --version 跑不通（镜像可能缺平台二进制）；可重试，或把 --cn 与官方源互换一次。"
+  fi
   ok "Claude Code 安装完成。"
 }
 
@@ -369,8 +384,8 @@ apply_settings() {
     log "    ANTHROPIC_BASE_URL=$BASE_URL"
     log "    ANTHROPIC_AUTH_TOKEN=${TOKEN%%-*}-****"
     log "    ANTHROPIC_MODEL=$MODEL ; ANTHROPIC_DEFAULT_HAIKU_MODEL=$MODEL"
-    log "    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1"
-    log "    DISABLE_TELEMETRY=1 ; DISABLE_ERROR_REPORTING=1 ; CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+    log "    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ; API_TIMEOUT_MS=600000"
+    log "    DISABLE_TELEMETRY=1 ; DISABLE_ERROR_REPORTING=1 ; CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ; DISABLE_AUTOUPDATER=1"
     return 0
   fi
   mkdir -p "$CLAUDE_DIR"
@@ -381,8 +396,8 @@ import json, os
 p=os.environ["PK_F"]
 newenv={"ANTHROPIC_BASE_URL":os.environ["PK_B"],"ANTHROPIC_AUTH_TOKEN":os.environ["PK_T"],
         "ANTHROPIC_MODEL":os.environ["PK_M"],"ANTHROPIC_DEFAULT_HAIKU_MODEL":os.environ["PK_M"],
-        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","DISABLE_TELEMETRY":"1",
-        "DISABLE_ERROR_REPORTING":"1","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"}
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","API_TIMEOUT_MS":"600000","DISABLE_TELEMETRY":"1",
+        "DISABLE_ERROR_REPORTING":"1","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1","DISABLE_AUTOUPDATER":"1"}
 data={}
 if os.path.exists(p):
     try: data=json.load(open(p)) or {}
@@ -394,13 +409,22 @@ json.dump(data, open(p,"w"), indent=2, ensure_ascii=False); open(p,"a").write("\
 PY
   elif has_cmd jq; then
     local ne tmp; tmp="$(mktemp)"
-    ne="$(jq -n --arg b "$BASE_URL" --arg t "$TOKEN" --arg m "$MODEL" '{ANTHROPIC_BASE_URL:$b,ANTHROPIC_AUTH_TOKEN:$t,ANTHROPIC_MODEL:$m,ANTHROPIC_DEFAULT_HAIKU_MODEL:$m,CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY:"1",DISABLE_TELEMETRY:"1",DISABLE_ERROR_REPORTING:"1",CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:"1"}')"
+    ne="$(jq -n --arg b "$BASE_URL" --arg t "$TOKEN" --arg m "$MODEL" '{ANTHROPIC_BASE_URL:$b,ANTHROPIC_AUTH_TOKEN:$t,ANTHROPIC_MODEL:$m,ANTHROPIC_DEFAULT_HAIKU_MODEL:$m,CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY:"1",API_TIMEOUT_MS:"600000",DISABLE_TELEMETRY:"1",DISABLE_ERROR_REPORTING:"1",CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:"1",DISABLE_AUTOUPDATER:"1"}')"
     if [ -f "$SETTINGS_FILE" ]; then jq --argjson ne "$ne" '.env = ((.env // {}) + $ne)' "$SETTINGS_FILE" > "$tmp" || die "jq 合并 settings.json 失败（JSON 损坏？）。"
     else printf '%s' "$ne" | jq '{env: .}' > "$tmp"; fi
     mv "$tmp" "$SETTINGS_FILE"
+  elif has_cmd node; then
+    PK_F="$SETTINGS_FILE" PK_B="$BASE_URL" PK_T="$TOKEN" PK_M="$MODEL" node -e '
+const fs=require("fs"),p=process.env.PK_F;
+const ne={ANTHROPIC_BASE_URL:process.env.PK_B,ANTHROPIC_AUTH_TOKEN:process.env.PK_T,ANTHROPIC_MODEL:process.env.PK_M,ANTHROPIC_DEFAULT_HAIKU_MODEL:process.env.PK_M,CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY:"1",API_TIMEOUT_MS:"600000",DISABLE_TELEMETRY:"1",DISABLE_ERROR_REPORTING:"1",CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:"1",DISABLE_AUTOUPDATER:"1"};
+let d={}; try{d=JSON.parse(fs.readFileSync(p,"utf8"))||{}}catch(e){}
+if(typeof d!=="object"||!d)d={};
+d.env=Object.assign((typeof d.env==="object"&&d.env)?d.env:{},ne);
+fs.writeFileSync(p, JSON.stringify(d,null,2)+"\n");
+' || die "node 合并 settings.json 失败。"
   else
-    [ -f "$SETTINGS_FILE" ] && die "已有 settings.json，需 python3 或 jq 才能安全合并。请装其一后重试。"
-    printf '{\n  "env": {\n    "ANTHROPIC_BASE_URL": "%s",\n    "ANTHROPIC_AUTH_TOKEN": "%s",\n    "ANTHROPIC_MODEL": "%s",\n    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "%s",\n    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",\n    "DISABLE_TELEMETRY": "1",\n    "DISABLE_ERROR_REPORTING": "1",\n    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"\n  }\n}\n' "$BASE_URL" "$TOKEN" "$MODEL" "$MODEL" > "$SETTINGS_FILE"
+    [ -f "$SETTINGS_FILE" ] && die "已有 settings.json，需 python3 / jq / node 之一才能安全合并。请装其一后重试。"
+    printf '{\n  "env": {\n    "ANTHROPIC_BASE_URL": "%s",\n    "ANTHROPIC_AUTH_TOKEN": "%s",\n    "ANTHROPIC_MODEL": "%s",\n    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "%s",\n    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",\n    "API_TIMEOUT_MS": "600000",\n    "DISABLE_TELEMETRY": "1",\n    "DISABLE_ERROR_REPORTING": "1",\n    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",\n    "DISABLE_AUTOUPDATER": "1"\n  }\n}\n' "$BASE_URL" "$TOKEN" "$MODEL" "$MODEL" > "$SETTINGS_FILE"
   fi
   chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
   ok "已写入 ${SETTINGS_FILE}（合并保留你的其它设置）。"
@@ -416,8 +440,8 @@ import sqlite3, json, os, time
 db=os.environ["PK_DB"]; setp=os.environ["PK_SET"]
 env={"ANTHROPIC_BASE_URL":os.environ["PK_B"],"ANTHROPIC_AUTH_TOKEN":os.environ["PK_T"],
      "ANTHROPIC_MODEL":os.environ["PK_M"],"ANTHROPIC_DEFAULT_HAIKU_MODEL":os.environ["PK_M"],
-     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","DISABLE_TELEMETRY":"1",
-     "DISABLE_ERROR_REPORTING":"1","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"}
+     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","API_TIMEOUT_MS":"600000","DISABLE_TELEMETRY":"1",
+     "DISABLE_ERROR_REPORTING":"1","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1","DISABLE_AUTOUPDATER":"1"}
 sc=json.dumps({"env":env}, ensure_ascii=False)
 con=sqlite3.connect(db, timeout=5); cur=con.cursor()
 cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='providers'")
@@ -454,9 +478,50 @@ print_ready() {
   log ""; ok "${C_BOLD}就绪！${C_RESET}"
   log "  额度：${C_BOLD}\$${QUOTA_USD}${C_RESET} 体验额度    默认模型：${C_BOLD}${MODEL}${C_RESET}    中转：${BASE_URL}"
   log ""
-  log "  ${C_DIM}想试更强的模型？对话里输入${C_RESET} ${C_BOLD}/model${C_RESET} ${C_DIM}可切 Claude / Gemini 等（已开网关模型发现）。${C_RESET}"
+  log "  ${C_DIM}已配好 apiget 中转，${C_RESET}${C_BOLD}无需登录 Anthropic 账号（别走 /login）${C_RESET}${C_DIM}，直接对话即可。${C_RESET}"
+  log "  ${C_DIM}进对话后输入${C_RESET} ${C_BOLD}/status${C_RESET} ${C_DIM}确认中转已生效；${C_RESET}${C_BOLD}/model${C_RESET} ${C_DIM}可切 Claude / Gemini 等（已开网关模型发现）。${C_RESET}"
+  log "  ${C_DIM}没自动启动？运行${C_RESET} ${C_BOLD}claude${C_RESET}${C_DIM}（若提示找不到，新开终端或 export PATH=\$HOME/.local/bin:\$PATH）。${C_RESET}"
   log "  ${C_DIM}想长期用 / 要更多额度？注册：${C_RESET}${REGISTER_URL}"
   log ""
+}
+
+# 预置 ~/.claude.json 跳过首启向导（主题/信任目录/项目向导），让用户落地即对话。
+# 读-改-合并（~/.claude.json 是 CC 大状态文件，绝不覆盖）；node（装完必有）优先，python3 兜底。
+skip_onboarding() {
+  [ "$DRY_RUN" = 1 ] && { info "[dry-run] 将标记 ~/.claude.json 跳过首启向导（主题/信任目录）。"; return 0; }
+  local cj="${HOME}/.claude.json" cwd; cwd="$(pwd)"
+  mkdir -p "$BACKUP_DIR"
+  [ -f "$cj" ] && cp "$cj" "$BACKUP_DIR/claude.json.bak.$(date +%Y%m%d%H%M%S 2>/dev/null||echo bak)" 2>/dev/null || true
+  if has_cmd node; then
+    PK_CJ="$cj" PK_CWD="$cwd" node -e '
+const fs=require("fs"),p=process.env.PK_CJ,cwd=process.env.PK_CWD;
+let d={}; try{d=JSON.parse(fs.readFileSync(p,"utf8"))||{}}catch(e){}
+if(typeof d!=="object"||!d)d={};
+d.hasCompletedOnboarding=true;
+if(typeof d.projects!=="object"||!d.projects)d.projects={};
+const pr=(typeof d.projects[cwd]==="object"&&d.projects[cwd])?d.projects[cwd]:{};
+pr.hasTrustDialogAccepted=true; pr.hasCompletedProjectOnboarding=true; d.projects[cwd]=pr;
+fs.writeFileSync(p, JSON.stringify(d,null,2));
+' 2>/dev/null && { ok "已跳过首启向导（主题/信任目录），落地即对话。"; return 0; }
+  fi
+  if has_cmd python3; then
+    PK_CJ="$cj" PK_CWD="$cwd" python3 - <<'PY' 2>/dev/null && { ok "已跳过首启向导（主题/信任目录）。"; return 0; }
+import json, os
+p=os.environ["PK_CJ"]; cwd=os.environ["PK_CWD"]
+d={}
+if os.path.exists(p):
+    try: d=json.load(open(p)) or {}
+    except Exception: d={}
+if not isinstance(d,dict): d={}
+d["hasCompletedOnboarding"]=True
+pj=d.get("projects") if isinstance(d.get("projects"),dict) else {}
+pr=pj.get(cwd) if isinstance(pj.get(cwd),dict) else {}
+pr["hasTrustDialogAccepted"]=True; pr["hasCompletedProjectOnboarding"]=True
+pj[cwd]=pr; d["projects"]=pj
+json.dump(d, open(p,"w"), indent=2, ensure_ascii=False)
+PY
+  fi
+  warn "未能预置跳过首启向导（不影响使用，首次 claude 手动选一次主题/信任目录即可）。"
 }
 
 maybe_launch() {
@@ -481,7 +546,7 @@ p=os.environ["PK_F"]
 try: data=json.load(open(p)) or {}
 except Exception: raise SystemExit(1)
 env=data.get("env") or {}
-for k in ("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY","DISABLE_TELEMETRY","DISABLE_ERROR_REPORTING","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"):
+for k in ("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY","API_TIMEOUT_MS","DISABLE_TELEMETRY","DISABLE_ERROR_REPORTING","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC","DISABLE_AUTOUPDATER"):
     env.pop(k,None)
 if env: data["env"]=env
 else: data.pop("env",None)
@@ -502,6 +567,7 @@ main() {
   obtain_token
   apply_settings
   handle_cc_switch
+  skip_onboarding
   print_ready
   maybe_launch
 }
