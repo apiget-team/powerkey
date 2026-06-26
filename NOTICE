@@ -1,0 +1,31 @@
+powerkey
+Copyright (c) 2026 apiget-team
+
+This product includes software derived from / informed by the following
+third-party open-source projects. We thank their authors.
+
+------------------------------------------------------------------------
+QuantumNous/new-api-docs  —  MIT License
+https://github.com/QuantumNous/new-api-docs
+  install.sh / install.ps1 derive their TTY-safe IO helpers
+  (read_tty / read_secret_tty / sh_single_quote), extract_host,
+  ensure_scheme, read_env_from_rcs, and the overall interactive
+  setup flow from this project's `helper/claude-cli-setup.{sh,ps1}`.
+------------------------------------------------------------------------
+UfoMiao/zcf  —  MIT License
+https://github.com/UfoMiao/zcf
+  The shape of the ~/.claude/settings.json `env` block (and the
+  DISABLE_TELEMETRY / non-essential-traffic keys) is informed by this
+  project's Claude Code settings template.
+------------------------------------------------------------------------
+farion1231/cc-switch  —  MIT License
+https://github.com/farion1231/cc-switch
+  The per-tool gateway-config field layout (ANTHROPIC_BASE_URL /
+  ANTHROPIC_AUTH_TOKEN / model fan-out, overwrite-safe writing) is
+  informed by this project's provider config writers.
+------------------------------------------------------------------------
+
+powerkey's own additions (Claude Code auto-install, settings.json writer,
+trial-key issuer integration, DeepSeek-V4 default, conflicting-env cleanup,
+--dry-run / --uninstall, TTY auto-launch, the issuer service) are original
+work under the MIT License (see LICENSE).

@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+#
+# powerkey — 一键装好 Claude Code 并接上 apiget.cc，直接能用
+# https://github.com/apiget-team/powerkey
+#
+#   curl -fsSL https://get.apiget.cc | bash
+#   curl -fsSL https://get.apiget.cc | bash -s -- [options]
+#
+# 做的事：探测环境 → 装/升级 Claude Code（最新）→ 领 $2 体验额度（或用 --key）
+#         → 写 ~/.claude/settings.json（合并不覆盖、清理冲突旧 env）→ 处理 cc-switch
+#         → 就绪（交互终端下自动拉起 claude）
+#
+# Options:
+#   --dry-run        只演示，不安装、不写配置、不领真 key
+#   --uninstall      撤销 powerkey 的配置改动（还原备份、删本地状态）
+#   --no-launch      装完不自动拉起 claude
+#   --force          忽略本地已领记录，强制重新领取
+#   --key TOKEN      直接用这个 apiget key（教程派发场景），跳过自动发码
+#   --base-url URL   覆盖 apiget API base（默认 https://api.apiget.cc）
+#   --issuer URL     覆盖发码服务端点（默认 https://get.apiget.cc）
+#   --ref CODE       推广/分销归因码（带进发码请求）
+#   --source NAME    来源标签（默认 powerkey）
+#   -h, --help       显示帮助
+#
+# ----------------------------------------------------------------------------
+# Derived from QuantumNous/new-api-docs `helper/claude-cli-setup.sh` (MIT) — the
+# TTY-safe IO helpers (read_tty/read_secret_tty/sh_single_quote), extract_host,
+# ensure_scheme, read_env_from_rcs and the overall interactive flow originate there.
+# The ~/.claude/settings.json `env` shape is informed by UfoMiao/zcf (MIT) and
+# farion1231/cc-switch (MIT). Full attribution in NOTICE. powerkey additions:
+# Claude Code auto-install, settings.json writer, trial-key issuer call, deepseek
+# default, conflicting-env cleanup, --dry-run/--uninstall, TTY auto-launch.
+# ----------------------------------------------------------------------------
+
+set -u
+umask 077
+
+# -------- 常量 --------
+POWERKEY_VERSION="0.1.0"
+DEFAULT_ISSUER="https://get.apiget.cc"
+DEFAULT_BASE_URL="https://api.apiget.cc"
+DEFAULT_MODEL="deepseek-v4-pro"        # 兜底；权威 model 由发码服务返回（服务端可改）
+REGISTER_URL="https://apiget.cc/register?ref=powerkey"
+CLAUDE_INSTALL_URL="https://claude.ai/install.sh"
+
+STATE_DIR="${HOME}/.powerkey"
+STATE_FILE="${STATE_DIR}/state.json"
+BACKUP_DIR="${STATE_DIR}/backups"
+CLAUDE_DIR="${HOME}/.claude"
+SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
+LOCAL_BIN="${HOME}/.local/bin"
+
+TOKEN=""
+QUOTA_USD="2"
+
+# -------- 日志（无 TTY / NO_COLOR 自动去色） --------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""
+fi
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s▸%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# -------- 通用工具（多数源自 MIT 基底） --------
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+trim() { printf "%s" "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+sh_single_quote() { printf "'%s'" "$(printf "%s" "${1:-}" | sed "s/'/'\\''/g")"; }
+
+# 交互判定：curl|bash 下 stdin 是管道，须借 /dev/tty 重连控制终端
+is_interactive() { [ -t 1 ] && [ -r /dev/tty ]; }
+read_tty()        { local p="${1:-}" in=""; is_interactive && { read -r -p "$p" in </dev/tty || true; }; printf "%s" "${in:-}"; }
+read_secret_tty() { local p="${1:-}" in=""; is_interactive && { read -r -s -p "$p" in </dev/tty || true; echo >&2; }; printf "%s" "${in:-}"; }
+
+extract_host() { local u="${1:-}"; u="${u#http://}"; u="${u#https://}"; printf "%s" "${u%%/*}"; }
+ensure_scheme() { case "${1:-}" in http://*|https://*) printf "%s" "$1";; *) printf "https://%s" "$1";; esac; }
+
+usage() {
+  cat <<'EOF'
+powerkey — 一键装好 Claude Code 并接上 apiget.cc
+
+  curl -fsSL https://get.apiget.cc | bash
+  curl -fsSL https://get.apiget.cc | bash -s -- [options]
+
+Options:
+  --dry-run        只演示，不安装、不写配置、不领真 key
+  --uninstall      撤销 powerkey 的配置改动（还原备份、删本地状态）
+  --no-launch      装完不自动拉起 claude
+  --force          忽略本地已领记录，强制重新领取
+  --key TOKEN      直接用这个 apiget key，跳过自动发码
+  --base-url URL   覆盖 apiget API base（默认 https://api.apiget.cc）
+  --issuer URL     覆盖发码服务端点（默认 https://get.apiget.cc）
+  --ref CODE       推广/分销归因码
+  --source NAME    来源标签（默认 powerkey）
+  -h, --help       显示帮助
+EOF
+}
+
+# -------- 参数 --------
+DRY_RUN=0; DO_UNINSTALL=0; NO_LAUNCH=0; FORCE=0
+ISSUER="$DEFAULT_ISSUER"; BASE_URL=""; MODEL=""; SUPPLIED_KEY=""
+SOURCE_TAG="powerkey"; REF=""; CHANNEL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)   DRY_RUN=1 ;;
+    --uninstall) DO_UNINSTALL=1 ;;
+    --no-launch) NO_LAUNCH=1 ;;
+    --force)     FORCE=1 ;;
+    --key)       SUPPLIED_KEY="${2:-}"; shift ;;
+    --base-url)  BASE_URL="${2:-}"; shift ;;
+    --issuer)    ISSUER="${2:-}"; shift ;;
+    --ref)       REF="${2:-}"; shift ;;
+    --source)    SOURCE_TAG="${2:-}"; shift ;;
+    --channel)   CHANNEL="${2:-}"; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           warn "未知选项：$1（--help 看用法）" ;;
+  esac
+  shift
+done
+[ -n "$REF" ] && [ -z "$CHANNEL" ] && CHANNEL="$REF"   # --ref 是 --channel 的别名
+
+# -------- 工具 --------
+detect_os()   { case "$(uname -s 2>/dev/null || echo unknown)" in Darwin) echo darwin;; Linux) echo linux;; *) echo unknown;; esac; }
+detect_arch() { uname -m 2>/dev/null | tr 'A-Z' 'a-z' || echo unknown; }
+sha256_hex()  { if has_cmd shasum; then shasum -a 256 | awk '{print $1}'; elif has_cmd sha256sum; then sha256sum | awk '{print $1}'; else cksum | awk '{print $1}'; fi; }
+
+# 机器指纹：稳定且不外传原始标识（只发哈希），用于防刷 L0/L1
+machine_fingerprint() {
+  local raw="" os; os="$(detect_os)"
+  if [ "$os" = darwin ]; then
+    raw="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/{print $4}')"
+  elif [ "$os" = linux ]; then
+    if   [ -r /etc/machine-id ];          then raw="$(cat /etc/machine-id 2>/dev/null)"
+    elif [ -r /var/lib/dbus/machine-id ]; then raw="$(cat /var/lib/dbus/machine-id 2>/dev/null)"; fi
+  fi
+  [ -n "$raw" ] || raw="$(hostname 2>/dev/null)-${USER:-user}"
+  printf '%s' "powerkey:${raw}:${USER:-user}" | sha256_hex
+}
+
+json_get() { # $1=json $2=key（顶层）
+  if has_cmd python3; then
+    PK_J="$1" PK_K="$2" python3 - <<'PY' 2>/dev/null
+import json, os
+try:
+    d = json.loads(os.environ["PK_J"]); v = d.get(os.environ["PK_K"])
+    print("" if v is None else (v if isinstance(v, str) else json.dumps(v)))
+except Exception: print("")
+PY
+  elif has_cmd jq; then printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // empty' 2>/dev/null
+  else printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1; fi
+}
+
+# -------- 步骤 --------
+print_banner() {
+  log ""
+  log "${C_BOLD}${C_CYAN}powerkey${C_RESET}  —  一键装 Claude Code · 接 apiget.cc"
+  log "${C_DIM}v${POWERKEY_VERSION}$([ "$DRY_RUN" = 1 ] && printf ' (dry-run)')${C_RESET}"
+  log ""
+}
+
+preflight() {
+  has_cmd curl || die "需要 curl，请先安装后重试。"
+  local os; os="$(detect_os)"
+  [ "$os" = unknown ] && die "本脚本支持 macOS / Linux。Windows 请用 install.ps1。"
+  has_cmd python3 || has_cmd jq || warn "未检测到 python3 或 jq：仅在 settings.json 不存在时能安全写入；建议装其一。"
+  info "环境：$os/$(detect_arch)"
+}
+
+# 探测/清理会覆盖 settings.json 的 shell ANTHROPIC_* 导出（shell env 优先级高于 settings.json）
+detect_conflicting_env() {
+  local vars="ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL" v live="" rc rc_hits=""
+  for v in $vars; do eval "[ -n \"\${$v:-}\" ]" && live="$live $v"; done
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.zprofile" "$HOME/.profile"; do
+    [ -f "$rc" ] || continue
+    grep -Eq '^[[:space:]]*(export[[:space:]]+)?(ANTHROPIC_BASE_URL|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_MODEL|ANTHROPIC_DEFAULT_HAIKU_MODEL)=' "$rc" 2>/dev/null && rc_hits="$rc_hits $rc"
+  done
+  [ -z "$live" ] && [ -z "$rc_hits" ] && return 0
+  warn "检测到已有 ANTHROPIC_* 环境变量——其优先级高于 settings.json，会让本次配置不生效："
+  [ -n "$live" ]    && warn "  当前 shell 已导出：${live# }（须 unset 或重开终端）"
+  [ -n "$rc_hits" ] && warn "  写在启动文件：${rc_hits# }"
+  if [ -n "$rc_hits" ] && [ "$DRY_RUN" = 0 ] && is_interactive; then
+    local a; a="$(read_tty "把这些启动文件里的旧 ANTHROPIC_* 行注释掉？（已先备份）[y/N] ")"
+    case "$a" in
+      y|Y|yes|YES)
+        mkdir -p "$BACKUP_DIR"
+        for rc in $rc_hits; do
+          cp "$rc" "$BACKUP_DIR/$(basename "$rc").bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)" 2>/dev/null || true
+          if has_cmd python3; then
+            PK_RC="$rc" python3 - <<'PY' 2>/dev/null || true
+import re, os
+p=os.environ["PK_RC"]
+pat=re.compile(r'^\s*(export\s+)?(ANTHROPIC_BASE_URL|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_MODEL|ANTHROPIC_DEFAULT_HAIKU_MODEL)=')
+out=[("# powerkey-disabled: "+l) if (pat.match(l) and not l.lstrip().startswith("#")) else l
+     for l in open(p, encoding="utf-8", errors="replace")]
+open(p,"w",encoding="utf-8").write("".join(out))
+PY
+          else
+            sed -i.bak -E 's/^([[:space:]]*(export[[:space:]]+)?(ANTHROPIC_BASE_URL|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_MODEL|ANTHROPIC_DEFAULT_HAIKU_MODEL)=)/# powerkey-disabled: \1/' "$rc" 2>/dev/null && rm -f "$rc.bak" 2>/dev/null || true
+          fi
+        done
+        ok "已注释旧 env 行（备份在 ${BACKUP_DIR}），新开终端生效。"
+        ;;
+      *) warn "已跳过。若配置不生效，请手动移除上述变量后重开终端。" ;;
+    esac
+  elif [ -n "$rc_hits" ]; then
+    warn "  → 请手动注释/删除这些行，或在交互终端重跑以自动处理。"
+  fi
+  [ -n "$live" ] && warn "  → 当前终端：unset${live} 后重开终端。"
+}
+
+claude_path() { command -v claude 2>/dev/null || { [ -x "$LOCAL_BIN/claude" ] && echo "$LOCAL_BIN/claude"; }; }
+
+ensure_claude_code() {
+  export PATH="$LOCAL_BIN:$PATH"
+  local existing; existing="$(claude_path)"
+  if [ -n "$existing" ]; then
+    info "已装 Claude Code（$("$existing" --version 2>/dev/null | head -n1)），尝试升级…"
+    [ "$DRY_RUN" = 1 ] && { ok "[dry-run] 跳过升级"; return 0; }
+    "$existing" update >/dev/null 2>&1 || curl -fsSL "$CLAUDE_INSTALL_URL" | bash >/dev/null 2>&1 || warn "升级未成功，沿用现有版本。"
+    ok "Claude Code 就绪。"; return 0
+  fi
+  info "未检测到 Claude Code，安装最新版…"
+  [ "$DRY_RUN" = 1 ] && { ok "[dry-run] 将执行：curl -fsSL $CLAUDE_INSTALL_URL | bash"; return 0; }
+  if curl -fsSL "$CLAUDE_INSTALL_URL" | bash; then :
+  elif has_cmd npm; then warn "原生安装失败，改用 npm…"; npm install -g @anthropic-ai/claude-code@latest || die "Claude Code 安装失败。"
+  else die "Claude Code 安装失败且无 npm。请装 Node 后重试，或见 https://code.claude.com/docs/en/setup"; fi
+  export PATH="$LOCAL_BIN:$PATH"
+  [ -n "$(claude_path)" ] || warn "已安装但 PATH 未含 claude；可能需把 $LOCAL_BIN 加入 PATH。"
+  ok "Claude Code 安装完成。"
+}
+
+# 发码服务契约（薄服务，部署在 $ISSUER 后）：
+#   POST {ISSUER}/issue  req {fingerprint,os,arch,source,channel,client_version}
+#   resp 成功 {ok:true,token,base_url,model,quota_usd}
+#   resp 降级 {ok:false,fallback_url,reason,message}
+issue_request() {
+  local fp os arch payload
+  fp="$(machine_fingerprint)"; os="$(detect_os)"; arch="$(detect_arch)"
+  if has_cmd python3; then
+    payload="$(PK_FP="$fp" PK_OS="$os" PK_ARCH="$arch" PK_SRC="$SOURCE_TAG" PK_CH="$CHANNEL" PK_VER="$POWERKEY_VERSION" python3 - <<'PY'
+import json, os
+print(json.dumps({"fingerprint":os.environ["PK_FP"],"os":os.environ["PK_OS"],"arch":os.environ["PK_ARCH"],
+                  "source":os.environ["PK_SRC"],"channel":os.environ["PK_CH"],"client_version":os.environ["PK_VER"]}))
+PY
+)"
+  else
+    payload="{\"fingerprint\":\"$fp\",\"os\":\"$os\",\"arch\":\"$arch\",\"source\":\"$SOURCE_TAG\",\"channel\":\"$CHANNEL\",\"client_version\":\"$POWERKEY_VERSION\"}"
+  fi
+  curl -fsS -X POST "${ISSUER%/}/issue" -H "Content-Type: application/json" \
+    -H "User-Agent: powerkey/${POWERKEY_VERSION}" --data "$payload" --max-time 30
+}
+
+save_state() {
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+  if has_cmd python3; then
+    PK_F="$STATE_FILE" PK_FP="$(machine_fingerprint)" PK_T="$TOKEN" PK_B="$BASE_URL" PK_M="$MODEL" python3 - <<'PY' 2>/dev/null || true
+import json, os
+json.dump({"fingerprint":os.environ["PK_FP"],"token":os.environ["PK_T"],"base_url":os.environ["PK_B"],"model":os.environ["PK_M"],"v":1}, open(os.environ["PK_F"],"w"))
+PY
+  else printf '{"token":"%s","base_url":"%s","model":"%s","v":1}\n' "$TOKEN" "$BASE_URL" "$MODEL" > "$STATE_FILE"; fi
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+}
+
+obtain_token() {
+  # 用户直接给了 key（教程派发场景）
+  if [ -n "$SUPPLIED_KEY" ]; then
+    TOKEN="$SUPPLIED_KEY"
+    [ -n "$BASE_URL" ] || BASE_URL="$DEFAULT_BASE_URL"; [ -n "$MODEL" ] || MODEL="$DEFAULT_MODEL"
+    ok "使用你提供的 key。"; return 0
+  fi
+  # L0：本机已领则复用（除非 --force）
+  if [ "$FORCE" = 0 ] && [ -f "$STATE_FILE" ]; then
+    local old t; old="$(cat "$STATE_FILE" 2>/dev/null)"; t="$(json_get "$old" token)"
+    if [ -n "$t" ]; then
+      TOKEN="$t"; [ -n "$BASE_URL" ] || BASE_URL="$(json_get "$old" base_url)"; [ -n "$MODEL" ] || MODEL="$(json_get "$old" model)"
+      ok "复用本机已领的体验额度（--force 可重领）。"; return 0
+    fi
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    TOKEN="sk-DRYRUN-xxxxxxxxxxxx"; [ -n "$BASE_URL" ] || BASE_URL="$DEFAULT_BASE_URL"; [ -n "$MODEL" ] || MODEL="$DEFAULT_MODEL"
+    ok "[dry-run] 将向 ${ISSUER%/}/issue 领 \$${QUOTA_USD} 体验额度（此处用假 token）。"; return 0
+  fi
+  info "向 apiget 领取 \$${QUOTA_USD} 体验额度…"
+  local resp; resp="$(issue_request)" || resp=""
+  if [ -z "$resp" ]; then warn "发码服务暂不可达。可稍后重试，或网页自助领取：$REGISTER_URL"; exit 2; fi
+  local okf; okf="$(json_get "$resp" ok)"
+  if [ "$okf" != "true" ] && [ "$okf" != "1" ]; then
+    local fb msg; fb="$(json_get "$resp" fallback_url)"; msg="$(json_get "$resp" message)"
+    [ -n "$msg" ] && warn "$msg"; log "自助领取：${fb:-$REGISTER_URL}"; exit 2
+  fi
+  TOKEN="$(json_get "$resp" token)"; [ -n "$TOKEN" ] || { warn "服务未返回 token。自助领取：$REGISTER_URL"; exit 2; }
+  [ -n "$BASE_URL" ] || BASE_URL="$(json_get "$resp" base_url)"; [ -n "$BASE_URL" ] || BASE_URL="$DEFAULT_BASE_URL"
+  [ -n "$MODEL" ] || MODEL="$(json_get "$resp" model)"; [ -n "$MODEL" ] || MODEL="$DEFAULT_MODEL"
+  local q; q="$(json_get "$resp" quota_usd)"; [ -n "$q" ] && QUOTA_USD="$q"
+  save_state; ok "已领到 \$${QUOTA_USD} 体验额度。"
+}
+
+# 合并写入 settings.json 的 env 块（保留其它字段；先备份）
+apply_settings() {
+  if [ "$DRY_RUN" = 1 ]; then
+    info "[dry-run] 将写入 $SETTINGS_FILE 的 env："
+    log "    ANTHROPIC_BASE_URL=$BASE_URL"
+    log "    ANTHROPIC_AUTH_TOKEN=${TOKEN%%-*}-****"
+    log "    ANTHROPIC_MODEL=$MODEL ; ANTHROPIC_DEFAULT_HAIKU_MODEL=$MODEL"
+    log "    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ; DISABLE_TELEMETRY=1"
+    return 0
+  fi
+  mkdir -p "$CLAUDE_DIR"
+  if [ -f "$SETTINGS_FILE" ]; then mkdir -p "$BACKUP_DIR"; cp "$SETTINGS_FILE" "$BACKUP_DIR/settings.json.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)" 2>/dev/null || true; fi
+  if has_cmd python3; then
+    PK_F="$SETTINGS_FILE" PK_B="$BASE_URL" PK_T="$TOKEN" PK_M="$MODEL" python3 - <<'PY' || die "写入 settings.json 失败。"
+import json, os
+p=os.environ["PK_F"]
+newenv={"ANTHROPIC_BASE_URL":os.environ["PK_B"],"ANTHROPIC_AUTH_TOKEN":os.environ["PK_T"],
+        "ANTHROPIC_MODEL":os.environ["PK_M"],"ANTHROPIC_DEFAULT_HAIKU_MODEL":os.environ["PK_M"],
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","DISABLE_TELEMETRY":"1"}
+data={}
+if os.path.exists(p):
+    try: data=json.load(open(p)) or {}
+    except Exception: data={}
+if not isinstance(data,dict): data={}
+env=data.get("env") if isinstance(data.get("env"),dict) else {}
+env.update(newenv); data["env"]=env
+json.dump(data, open(p,"w"), indent=2, ensure_ascii=False); open(p,"a").write("\n")
+PY
+  elif has_cmd jq; then
+    local ne tmp; tmp="$(mktemp)"
+    ne="$(jq -n --arg b "$BASE_URL" --arg t "$TOKEN" --arg m "$MODEL" '{ANTHROPIC_BASE_URL:$b,ANTHROPIC_AUTH_TOKEN:$t,ANTHROPIC_MODEL:$m,ANTHROPIC_DEFAULT_HAIKU_MODEL:$m,CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY:"1",DISABLE_TELEMETRY:"1"}')"
+    if [ -f "$SETTINGS_FILE" ]; then jq --argjson ne "$ne" '.env = ((.env // {}) + $ne)' "$SETTINGS_FILE" > "$tmp" || die "jq 合并 settings.json 失败（JSON 损坏？）。"
+    else printf '%s' "$ne" | jq '{env: .}' > "$tmp"; fi
+    mv "$tmp" "$SETTINGS_FILE"
+  else
+    [ -f "$SETTINGS_FILE" ] && die "已有 settings.json，需 python3 或 jq 才能安全合并。请装其一后重试。"
+    printf '{\n  "env": {\n    "ANTHROPIC_BASE_URL": "%s",\n    "ANTHROPIC_AUTH_TOKEN": "%s",\n    "ANTHROPIC_MODEL": "%s",\n    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "%s",\n    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",\n    "DISABLE_TELEMETRY": "1"\n  }\n}\n' "$BASE_URL" "$TOKEN" "$MODEL" "$MODEL" > "$SETTINGS_FILE"
+  fi
+  chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
+  ok "已写入 ${SETTINGS_FILE}（合并保留你的其它设置）。"
+}
+
+detect_cc_switch() {
+  if [ -e "$HOME/.cc-switch/cc-switch.db" ] || [ -d "$HOME/.cc-switch" ] || [ -d "/Applications/CC Switch.app" ]; then
+    warn "检测到 cc-switch：已直接写 ~/.claude/settings.json（CC 实际读这份，cc-switch 切换时也写它）。"
+    warn "  注意：若你之后在 cc-switch 里切 provider，会覆盖本配置——请在 cc-switch 里也加一个 apiget provider 以便保留。"
+  fi
+}
+
+print_ready() {
+  log ""; ok "${C_BOLD}就绪！${C_RESET}"
+  log "  额度：${C_BOLD}\$${QUOTA_USD}${C_RESET} 体验额度    默认模型：${C_BOLD}${MODEL}${C_RESET}    中转：${BASE_URL}"
+  log ""
+  log "  ${C_DIM}想试更强的模型？对话里输入${C_RESET} ${C_BOLD}/model${C_RESET} ${C_DIM}可切 Claude / Gemini 等（已开网关模型发现）。${C_RESET}"
+  log "  ${C_DIM}想长期用 / 要更多额度？注册：${C_RESET}${REGISTER_URL}"
+  log ""
+}
+
+maybe_launch() {
+  [ "$DRY_RUN" = 1 ] && { info "[dry-run] 交互终端下本会在此自动运行 claude。"; return 0; }
+  local cb; cb="$(claude_path)"
+  if [ "$NO_LAUNCH" = 1 ] || [ -z "$cb" ]; then log "运行 ${C_BOLD}claude${C_RESET} 开始体验。"; return 0; fi
+  if is_interactive; then info "启动 claude …（Ctrl-C 退出）"; exec "$cb" </dev/tty
+  else log "运行 ${C_BOLD}claude${C_RESET} 开始体验。"; fi
+}
+
+do_uninstall() {
+  info "撤销 powerkey 的配置改动…"
+  local restored=0 latest
+  if [ -d "$BACKUP_DIR" ]; then
+    latest="$(ls -1t "$BACKUP_DIR"/settings.json.bak.* 2>/dev/null | head -n1)"
+    [ -n "${latest:-}" ] && [ -f "$latest" ] && cp "$latest" "$SETTINGS_FILE" && { ok "已还原 settings.json（来自 ${latest}）。"; restored=1; }
+  fi
+  if [ "$restored" = 0 ] && [ -f "$SETTINGS_FILE" ] && has_cmd python3; then
+    PK_F="$SETTINGS_FILE" python3 - <<'PY' 2>/dev/null && ok "已移除 powerkey 写入的 env 键。"
+import json, os
+p=os.environ["PK_F"]
+try: data=json.load(open(p)) or {}
+except Exception: raise SystemExit(1)
+env=data.get("env") or {}
+for k in ("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY","DISABLE_TELEMETRY"):
+    env.pop(k,None)
+if env: data["env"]=env
+else: data.pop("env",None)
+json.dump(data, open(p,"w"), indent=2, ensure_ascii=False); open(p,"a").write("\n")
+PY
+  fi
+  rm -f "$STATE_FILE" 2>/dev/null || true
+  ok "完成。（未卸载 Claude Code 本身；被注释的 shell 变量备份在 ${BACKUP_DIR}）"
+}
+
+# ----------------------------------------------------------------------------
+main() {
+  print_banner
+  [ "$DO_UNINSTALL" = 1 ] && { do_uninstall; exit 0; }
+  preflight
+  detect_conflicting_env
+  ensure_claude_code
+  obtain_token
+  apply_settings
+  detect_cc_switch
+  print_ready
+  maybe_launch
+}
+
+# 允许测试时 source 只加载函数（不执行）：POWERKEY_SOURCE_ONLY=1
+[ "${POWERKEY_SOURCE_ONLY:-0}" = "1" ] || main

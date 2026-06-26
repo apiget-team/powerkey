@@ -1,0 +1,35 @@
+# secrets / local config — NEVER commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+*.enc.yaml
+
+# issuer build artifacts
+server/powerkey-issuer
+server/issuer
+*.exe
+/dist/
+/bin/
+
+# runtime / local state
+*.db
+*.sqlite
+*.sqlite3
+
+# deps
+node_modules/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# test scratch
+/tmp/
+*.log

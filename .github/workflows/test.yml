@@ -1,0 +1,61 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    name: shell (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: syntax (bash -n)
+        run: bash -n install.sh
+      - name: shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -qq && sudo apt-get install -y shellcheck; else brew install shellcheck; fi
+          fi
+          shellcheck -S error install.sh
+      - name: unit tests
+        run: bash test/test_install.sh
+      - name: unit tests (LC_ALL=C)
+        run: LC_ALL=C bash test/test_install.sh
+      - name: e2e (mock issuer)
+        run: bash test/test_e2e.sh
+
+  powershell:
+    name: powershell parse
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse install.ps1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null; $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\install.ps1), [ref]$tokens, [ref]$errs) | Out-Null
+          if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_ }; exit 1 }
+          Write-Host "install.ps1 parses OK"
+
+  issuer:
+    name: issuer (go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: gofmt
+        working-directory: server
+        run: test -z "$(gofmt -l .)"
+      - name: vet + build
+        working-directory: server
+        run: |
+          go vet ./...
+          CGO_ENABLED=0 go build ./...
