@@ -1,0 +1,55 @@
+name: live-smoke
+
+# 真机冒烟：在 GitHub 自带的 Linux / macOS / Windows 云跑机上，对 LIVE 的
+# get.apiget.cc 真跑安装器 → claude -p 基础对话 → 工具调用 → 重跑幂等。
+# 手动触发（每次会在 trial 账号 id=31 下铸少量 $2 token，便宜）。
+# 注意：脚本只 grep settings.json，绝不打印其中的 token；模型补全文本(PONG/工具输出)非敏感。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  unix:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: install + smoke
+        run: |
+          set +e; FAIL=0; m(){ echo "SMOKE: $*"; }
+          m "A clean install"
+          curl -fsSL https://get.apiget.cc | bash -s -- --no-launch || { m "install FAIL"; FAIL=1; }
+          export PATH="$HOME/.local/bin:$PATH"
+          { grep -q api.apiget.cc "$HOME/.claude/settings.json" && grep -q deepseek-v4-pro "$HOME/.claude/settings.json"; } && m "settings OK" || { m "settings FAIL"; FAIL=1; }
+          claude --version && m "claude-installed OK" || { m "claude-installed FAIL"; FAIL=1; }
+          OUT=$(claude -p "Reply with exactly one word: PONG" 2>&1); m "basic-out: $(echo "$OUT" | tr -d '\n' | cut -c1-160)"
+          echo "$OUT" | grep -qi PONG && m "basic OK" || { m "basic FAIL"; FAIL=1; }
+          TOUT=$(claude --dangerously-skip-permissions -p "Run the shell command: echo hello-from-tool -- then reply only its exact stdout." 2>&1); m "tool-out: $(echo "$TOUT" | tr -d '\n' | cut -c1-240)"
+          echo "$TOUT" | grep -q hello-from-tool && m "tool OK" || { m "tool FAIL"; FAIL=1; }
+          RB=$(curl -fsSL https://get.apiget.cc | bash -s -- --no-launch 2>&1); echo "$RB" | grep -q "复用本机已领" && m "rerun-idempotent OK" || m "rerun-idempotent CHECK"
+          m "RESULT FAIL=$FAIL"; [ "$FAIL" = 0 ]
+
+  windows:
+    name: windows-latest
+    runs-on: windows-latest
+    steps:
+      - name: install + smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'; $fail = 0
+          function M($s) { Write-Host "SMOKE: $s" }
+          M "A clean install"
+          & ([scriptblock]::Create((irm https://get.apiget.cc/install.ps1))) -NoLaunch
+          $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
+          $sf = Join-Path $env:USERPROFILE ".claude\settings.json"
+          $c = if (Test-Path $sf) { Get-Content $sf -Raw } else { "" }
+          if (($c -match 'api\.apiget\.cc') -and ($c -match 'deepseek-v4-pro')) { M "settings OK" } else { M "settings FAIL"; $fail = 1 }
+          claude --version; if ($LASTEXITCODE -eq 0) { M "claude-installed OK" } else { M "claude-installed FAIL"; $fail = 1 }
+          $out = (claude -p "Reply with exactly one word: PONG" 2>&1) -join ' '; M ("basic-out: " + $out.Substring(0, [Math]::Min(160, $out.Length)))
+          if ($out -match 'PONG') { M "basic OK" } else { M "basic FAIL"; $fail = 1 }
+          $tout = (claude --dangerously-skip-permissions -p "Run the shell command: echo hello-from-tool -- then reply only its exact stdout." 2>&1) -join ' '; M ("tool-out: " + $tout.Substring(0, [Math]::Min(240, $tout.Length)))
+          if ($tout -match 'hello-from-tool') { M "tool OK" } else { M "tool FAIL"; $fail = 1 }
+          M "RESULT FAIL=$fail"; if ($fail -ne 0) { exit 1 }
