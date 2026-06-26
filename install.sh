@@ -166,7 +166,13 @@ try:
 except Exception: print("")
 PY
   elif has_cmd jq; then printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // empty' 2>/dev/null
-  else printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1; fi
+  else
+    # 无 python3/jq 的 sed 兜底：先取带引号字符串值；取不到再取无引号值（布尔/数字，如 "ok":true / "quota_usd":2）
+    local _v
+    _v="$(printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1)"
+    [ -n "$_v" ] || _v="$(printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([^\",}[:space:]]*\).*/\1/p" | head -n1)"
+    printf '%s' "$_v"
+  fi
 }
 
 # -------- 步骤 --------
@@ -181,7 +187,7 @@ preflight() {
   has_cmd curl || die "需要 curl，请先安装后重试。"
   local os; os="$(detect_os)"
   [ "$os" = unknown ] && die "本脚本支持 macOS / Linux。Windows 请用 install.ps1。"
-  has_cmd python3 || has_cmd jq || warn "未检测到 python3 或 jq：仅在 settings.json 不存在时能安全写入；建议装其一。"
+  has_cmd python3 || has_cmd jq || warn "未检测到 python3 或 jq：将用安装后的 Node 合并 settings.json（仍建议装 python3 获最稳路径）。"
   info "环境：$os/$(detect_arch)$([ "$CN" = 1 ] && printf '（国内镜像模式）')"
 }
 
