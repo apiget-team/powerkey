@@ -69,3 +69,78 @@ jobs:
           OUT=$(claude -p "Reply with exactly one word: PONG" 2>&1); m "basic-out: $(echo "$OUT" | tr -d '\n' | cut -c1-160)"
           echo "$OUT" | grep -qi PONG && m "basic OK" || { m "basic FAIL"; FAIL=1; }
           m "RESULT FAIL=$FAIL"; [ "$FAIL" = 0 ]
+
+  ccswitch-unix:
+    name: cc-switch ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: seed mock cc-switch -> install -> verify
+        run: |
+          set +e; FAIL=0; m(){ echo "SMOKE: $*"; }
+          mkdir -p "$HOME/.cc-switch"
+          python3 - <<'PY'
+          import sqlite3, os
+          con = sqlite3.connect(os.path.expanduser("~/.cc-switch/cc-switch.db"))
+          con.execute("CREATE TABLE providers (id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, settings_config TEXT NOT NULL, website_url TEXT, category TEXT, created_at INTEGER, sort_index INTEGER, notes TEXT, icon TEXT, icon_color TEXT, meta TEXT NOT NULL DEFAULT '{}', is_current BOOLEAN NOT NULL DEFAULT 0, in_failover_queue BOOLEAN NOT NULL DEFAULT 0, PRIMARY KEY (id, app_type))")
+          con.execute("INSERT INTO providers (id,app_type,name,settings_config,is_current) VALUES ('default','claude','Default','{}',1)")
+          con.commit(); con.close()
+          PY
+          m "seeded mock cc-switch DB (real providers schema)"
+          curl -fsSL https://get.apiget.cc | bash -s -- --no-launch || { m "install FAIL"; FAIL=1; }
+          python3 - <<'PY'
+          import sqlite3, os, json, sys
+          con = sqlite3.connect(os.path.expanduser("~/.cc-switch/cc-switch.db"))
+          ap = con.execute("SELECT settings_config,is_current FROM providers WHERE id='apiget' AND app_type='claude'").fetchone()
+          df = con.execute("SELECT is_current FROM providers WHERE id='default'").fetchone()
+          try: cur = json.load(open(os.path.expanduser("~/.cc-switch/settings.json"))).get("current_provider_claude","")
+          except Exception: cur = ""
+          okk = bool(ap) and ap[1]==1 and "api.apiget.cc" in ap[0] and "deepseek-v4-pro" in ap[0] and df and df[0]==0 and cur=="apiget"
+          print("SMOKE: ccs apiget_current=%s default_cleared=%s settings_ptr=%s" % (ap[1] if ap else None, df[0] if df else None, cur))
+          sys.exit(0 if okk else 1)
+          PY
+          if [ $? = 0 ]; then m "cc-switch configured OK (apiget=current, default cleared, settings ptr)"; else m "cc-switch FAIL"; FAIL=1; fi
+          m "RESULT FAIL=$FAIL"; [ "$FAIL" = 0 ]
+
+  ccswitch-windows:
+    name: cc-switch windows-latest
+    runs-on: windows-latest
+    steps:
+      - name: seed mock cc-switch -> install -> verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'; $fail = 0
+          function M($s) { Write-Host "SMOKE: $s" }
+          $py = (Get-Command python -ErrorAction SilentlyContinue); if (-not $py) { $py = Get-Command python3 }
+          $seed = @'
+          import sqlite3, os
+          p = os.path.join(os.path.expanduser("~"), ".cc-switch", "cc-switch.db")
+          os.makedirs(os.path.dirname(p), exist_ok=True)
+          con = sqlite3.connect(p)
+          con.execute("CREATE TABLE providers (id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, settings_config TEXT NOT NULL, website_url TEXT, category TEXT, created_at INTEGER, sort_index INTEGER, notes TEXT, icon TEXT, icon_color TEXT, meta TEXT NOT NULL DEFAULT '{}', is_current BOOLEAN NOT NULL DEFAULT 0, in_failover_queue BOOLEAN NOT NULL DEFAULT 0, PRIMARY KEY (id, app_type))")
+          con.execute("INSERT INTO providers (id,app_type,name,settings_config,is_current) VALUES ('default','claude','Default','{}',1)")
+          con.commit(); con.close()
+          '@
+          Set-Content -Path seed.py -Value $seed -Encoding UTF8
+          & $py.Source seed.py
+          M "seeded mock cc-switch DB"
+          & ([scriptblock]::Create((irm https://get.apiget.cc/install.ps1))) -NoLaunch
+          $verify = @'
+          import sqlite3, os, json, sys
+          db = os.path.join(os.path.expanduser("~"), ".cc-switch", "cc-switch.db")
+          con = sqlite3.connect(db)
+          ap = con.execute("SELECT settings_config,is_current FROM providers WHERE id='apiget' AND app_type='claude'").fetchone()
+          df = con.execute("SELECT is_current FROM providers WHERE id='default'").fetchone()
+          try: cur = json.load(open(os.path.join(os.path.expanduser("~"), ".cc-switch", "settings.json"))).get("current_provider_claude","")
+          except Exception: cur = ""
+          okk = bool(ap) and ap[1]==1 and "api.apiget.cc" in ap[0] and "deepseek-v4-pro" in ap[0] and df and df[0]==0 and cur=="apiget"
+          print("SMOKE: ccs apiget_current=%s default_cleared=%s settings_ptr=%s" % (ap[1] if ap else None, df[0] if df else None, cur))
+          sys.exit(0 if okk else 1)
+          '@
+          Set-Content -Path verify.py -Value $verify -Encoding UTF8
+          & $py.Source verify.py
+          if ($LASTEXITCODE -eq 0) { M "cc-switch configured OK" } else { M "cc-switch FAIL"; $fail = 1 }
+          M "RESULT FAIL=$fail"; if ($fail -ne 0) { exit 1 }
