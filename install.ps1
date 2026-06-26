@@ -4,14 +4,15 @@
 # https://github.com/apiget-team/powerkey
 #
 #   irm https://get.apiget.cc/install.ps1 | iex
-#   # 带参数：
-#   & ([scriptblock]::Create((irm https://get.apiget.cc/install.ps1))) -Key sk-xxx
+#   # 带参数（含国内镜像 -Cn）：
+#   & ([scriptblock]::Create((irm https://get.apiget.cc/install.ps1))) -Cn
 #
-# 与 install.sh 同源同行为：装/升级 Claude Code → 领 $2 体验额度（或 -Key）→ 写
-# %USERPROFILE%\.claude\settings.json 的 env 块（合并不覆盖）→ 处理冲突 env → 就绪。
+# 与 install.sh 同源同行为：装/升级 Claude Code（官方源失败自动回退国内镜像 npmmirror）→
+# 领 $2 体验额度（或 -Key）→ 写 %USERPROFILE%\.claude\settings.json 的 env 块（合并不覆盖、
+# 清冲突 env、关非必要外联）→ 就绪。
 #
 # Derived from QuantumNous/new-api-docs `helper/claude-cli-setup.ps1` (MIT). See NOTICE.
-# ⚠ Windows v1.1：逻辑对齐 install.sh，CI 做语法 parse；首次真机请做 Windows 冒烟。
+# ⚠ Windows v1.1：逻辑对齐 install.sh，CI 做语法 parse + npmmirror 真装冒烟；其余以真机为准。
 
 [CmdletBinding()]
 param(
@@ -19,6 +20,7 @@ param(
   [switch]$Uninstall,
   [switch]$NoLaunch,
   [switch]$Force,
+  [switch]$Cn      = ($env:POWERKEY_CN -eq '1'),
   [string]$Key     = $env:POWERKEY_KEY,
   [string]$BaseUrl = $env:POWERKEY_BASE_URL,
   [string]$Issuer  = $(if ($env:POWERKEY_ISSUER) { $env:POWERKEY_ISSUER } else { 'https://get.apiget.cc' }),
@@ -35,9 +37,13 @@ $DefaultBaseUrl  = 'https://api.apiget.cc'
 $DefaultModel    = 'deepseek-v4-pro'
 $RegisterUrl     = 'https://apiget.cc/register?ref=powerkey'
 $ClaudeInstall   = 'https://claude.ai/install.ps1'
+$NpmCnRegistry   = 'https://registry.npmmirror.com'
+$NodeCnMirror    = 'https://registry.npmmirror.com/-/binary/node'
+$NodeVer         = 'v22.11.0'
 $StateDir        = Join-Path $HOME '.powerkey'
 $StateFile       = Join-Path $StateDir 'state.json'
 $BackupDir       = Join-Path $StateDir 'backups'
+$NodeDir         = Join-Path $StateDir 'node'
 $ClaudeDir       = Join-Path $HOME '.claude'
 $SettingsFile    = Join-Path $ClaudeDir 'settings.json'
 $LocalBin        = Join-Path $HOME '.local\bin'
@@ -66,8 +72,9 @@ function Get-Fingerprint {
 function Get-ClaudeExe {
   $c = Get-Command claude -ErrorAction SilentlyContinue
   if ($c) { return $c.Source }
-  $p = Join-Path $LocalBin 'claude.exe'
-  if (Test-Path $p) { return $p }
+  foreach ($p in @((Join-Path $LocalBin 'claude.exe'), (Join-Path $LocalBin 'claude.cmd'))) {
+    if (Test-Path $p) { return $p }
+  }
   return $null
 }
 
@@ -75,7 +82,7 @@ function Get-ClaudeExe {
 function Show-Banner {
   Write-Host ''
   Write-Host 'powerkey  —  一键装 Claude Code · 接 apiget.cc' -ForegroundColor Cyan
-  Write-Host "v$PowerkeyVersion$(if ($DryRun) { ' (dry-run)' })" -ForegroundColor DarkGray
+  Write-Host "v$PowerkeyVersion$(if ($DryRun) { ' (dry-run)' })$(if ($Cn) { ' (cn)' })" -ForegroundColor DarkGray
   Write-Host ''
 }
 
@@ -96,20 +103,50 @@ function Test-ConflictingEnv {
   }
 }
 
+# 没有 Node 时从国内镜像装（解压到 ~/.powerkey/node，加入本次+User PATH）
+function Install-NodeCn {
+  if (Test-Cmd npm) { return }
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+  $name = "node-$NodeVer-win-$arch"
+  $url  = "$NodeCnMirror/$NodeVer/$name.zip"
+  Info "未检测到 Node，正从国内镜像装 Node ${NodeVer}…"
+  New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null
+  $zip = Join-Path $NodeDir "$name.zip"
+  Invoke-WebRequest -Uri $url -OutFile $zip -TimeoutSec 180
+  Expand-Archive -Path $zip -DestinationPath $NodeDir -Force
+  Remove-Item $zip -ErrorAction SilentlyContinue
+  $bin = Join-Path $NodeDir $name
+  $env:PATH = "$bin;$env:PATH"
+  $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+  if ($userPath -notlike "*$bin*") { [Environment]::SetEnvironmentVariable('PATH', "$bin;$userPath", 'User') }
+  if (-not (Test-Cmd npm)) { Die 'Node 装好但 npm 不可用。' }
+  Ok "Node ${NodeVer} 已装到 ${NodeDir}。"
+}
+
+# 经国内镜像装 Claude Code（不连 github/claude.ai）
+function Install-ClaudeCn {
+  Install-NodeCn
+  Info '经国内镜像（npmmirror）安装 Claude Code…'
+  npm install -g '@anthropic-ai/claude-code@latest' --registry $NpmCnRegistry
+  if ($LASTEXITCODE -ne 0) { Die '国内镜像安装 Claude Code 失败。' }
+}
+
 function Install-ClaudeCode {
   $exe = Get-ClaudeExe
   if ($exe) {
     Info "已装 Claude Code（$(& $exe --version 2>$null)），尝试升级…"
     if ($DryRun) { Ok '[dry-run] 跳过升级'; return }
-    try { & $exe update 2>$null } catch { try { irm $ClaudeInstall | iex } catch { Warn '升级未成功，沿用现有版本。' } }
+    if ($Cn) { try { Install-ClaudeCn } catch { Warn '升级未成功，沿用现有版本。' } }
+    else { try { & $exe update 2>$null } catch { Warn '升级未成功，沿用现有版本。' } }
     Ok 'Claude Code 就绪。'; return
   }
   Info '未检测到 Claude Code，安装最新版…'
-  if ($DryRun) { Ok "[dry-run] 将执行：irm $ClaudeInstall | iex"; return }
-  try { irm $ClaudeInstall | iex }
-  catch {
-    if (Test-Cmd npm) { Warn '原生安装失败，改用 npm…'; npm install -g '@anthropic-ai/claude-code@latest' }
-    else { Die 'Claude Code 安装失败且无 npm。请装 Node 后重试，或见 https://code.claude.com/docs/en/setup' }
+  if ($DryRun) { Ok "[dry-run] 将安装 Claude Code（Cn=${Cn}：true=国内镜像 npmmirror；false=官方源失败再回退国内镜像）"; return }
+  if ($Cn) {
+    Install-ClaudeCn
+  } else {
+    try { irm $ClaudeInstall | iex; if (-not (Get-ClaudeExe)) { throw '官方源未生成 claude' } }
+    catch { Warn "官方源安装失败（可能国内网络），改用国内镜像 npmmirror…"; Install-ClaudeCn }
   }
   Ok 'Claude Code 安装完成。'
 }
@@ -162,6 +199,7 @@ function Set-Settings($base, $token, $model) {
     Write-Host "    ANTHROPIC_BASE_URL=$base"
     Write-Host "    ANTHROPIC_AUTH_TOKEN=$($token.Substring(0,[Math]::Min(6,$token.Length)))****"
     Write-Host "    ANTHROPIC_MODEL=$model ; ANTHROPIC_DEFAULT_HAIKU_MODEL=$model"
+    Write-Host "    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ; DISABLE_TELEMETRY=1 ; DISABLE_ERROR_REPORTING=1 ; CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
     return
   }
   New-Item -ItemType Directory -Force -Path $ClaudeDir | Out-Null
@@ -172,14 +210,16 @@ function Set-Settings($base, $token, $model) {
     try { $obj = ConvertTo-HashtableDeep (Get-Content $SettingsFile -Raw | ConvertFrom-Json) } catch { $obj = @{} }
   }
   if (-not ($obj.env -is [hashtable])) { $obj.env = @{} }
-  $obj.env.ANTHROPIC_BASE_URL                        = $base
-  $obj.env.ANTHROPIC_AUTH_TOKEN                       = $token
-  $obj.env.ANTHROPIC_MODEL                            = $model
-  $obj.env.ANTHROPIC_DEFAULT_HAIKU_MODEL             = $model
-  $obj.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1'
-  $obj.env.DISABLE_TELEMETRY                          = '1'
+  $obj.env.ANTHROPIC_BASE_URL                         = $base
+  $obj.env.ANTHROPIC_AUTH_TOKEN                        = $token
+  $obj.env.ANTHROPIC_MODEL                             = $model
+  $obj.env.ANTHROPIC_DEFAULT_HAIKU_MODEL              = $model
+  $obj.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY  = '1'
+  $obj.env.DISABLE_TELEMETRY                           = '1'
+  $obj.env.DISABLE_ERROR_REPORTING                     = '1'
+  $obj.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC    = '1'
   ($obj | ConvertTo-Json -Depth 20) | Set-Content -Path $SettingsFile -Encoding UTF8
-  Ok "已写入 $SettingsFile（合并保留你的其它设置）。"
+  Ok "已写入 ${SettingsFile}（合并保留你的其它设置）。"
 }
 
 function Show-Ready($base, $model, $quota) {
@@ -203,7 +243,7 @@ function Invoke-Uninstall {
     try {
       $obj = ConvertTo-HashtableDeep (Get-Content $SettingsFile -Raw | ConvertFrom-Json)
       if ($obj.env -is [hashtable]) {
-        foreach ($k in 'ANTHROPIC_BASE_URL','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL','CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY','DISABLE_TELEMETRY') { $obj.env.Remove($k) }
+        foreach ($k in 'ANTHROPIC_BASE_URL','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL','CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY','DISABLE_TELEMETRY','DISABLE_ERROR_REPORTING','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC') { $obj.env.Remove($k) }
       }
       ($obj | ConvertTo-Json -Depth 20) | Set-Content -Path $SettingsFile -Encoding UTF8
       Ok '已移除 powerkey 写入的 env 键。'

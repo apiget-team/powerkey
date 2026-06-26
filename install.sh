@@ -6,15 +6,16 @@
 #   curl -fsSL https://get.apiget.cc | bash
 #   curl -fsSL https://get.apiget.cc | bash -s -- [options]
 #
-# 做的事：探测环境 → 装/升级 Claude Code（最新）→ 领 $2 体验额度（或用 --key）
-#         → 写 ~/.claude/settings.json（合并不覆盖、清理冲突旧 env）→ 处理 cc-switch
-#         → 就绪（交互终端下自动拉起 claude）
+# 做的事：探测环境 → 装/升级 Claude Code（官方源失败自动回退国内镜像）→ 领 $2 体验额度
+#         → 写 ~/.claude/settings.json（合并不覆盖、清理冲突旧 env、关非必要外联）
+#         → 处理 cc-switch → 就绪（交互终端下自动拉起 claude）
 #
 # Options:
 #   --dry-run        只演示，不安装、不写配置、不领真 key
 #   --uninstall      撤销 powerkey 的配置改动（还原备份、删本地状态）
 #   --no-launch      装完不自动拉起 claude
 #   --force          忽略本地已领记录，强制重新领取
+#   --cn             强制走国内镜像源装 Claude Code（不连 github/claude.ai）
 #   --key TOKEN      直接用这个 apiget key（教程派发场景），跳过自动发码
 #   --base-url URL   覆盖 apiget API base（默认 https://api.apiget.cc）
 #   --issuer URL     覆盖发码服务端点（默认 https://get.apiget.cc）
@@ -28,8 +29,9 @@
 # ensure_scheme, read_env_from_rcs and the overall interactive flow originate there.
 # The ~/.claude/settings.json `env` shape is informed by UfoMiao/zcf (MIT) and
 # farion1231/cc-switch (MIT). Full attribution in NOTICE. powerkey additions:
-# Claude Code auto-install, settings.json writer, trial-key issuer call, deepseek
-# default, conflicting-env cleanup, --dry-run/--uninstall, TTY auto-launch.
+# Claude Code auto-install (+ China npmmirror fallback), settings.json writer,
+# trial-key issuer call, deepseek default, conflicting-env cleanup, --dry-run/
+# --uninstall, TTY auto-launch.
 # ----------------------------------------------------------------------------
 
 set -u
@@ -42,10 +44,14 @@ DEFAULT_BASE_URL="https://api.apiget.cc"
 DEFAULT_MODEL="deepseek-v4-pro"        # 兜底；权威 model 由发码服务返回（服务端可改）
 REGISTER_URL="https://apiget.cc/register?ref=powerkey"
 CLAUDE_INSTALL_URL="https://claude.ai/install.sh"
+NPM_CN_REGISTRY="https://registry.npmmirror.com"               # 国内 npm 镜像
+NODE_CN_MIRROR="https://registry.npmmirror.com/-/binary/node"  # 国内 Node 二进制镜像
+NODE_VER="v22.11.0"                                            # 国内装 Node 时用（LTS，可升）
 
 STATE_DIR="${HOME}/.powerkey"
 STATE_FILE="${STATE_DIR}/state.json"
 BACKUP_DIR="${STATE_DIR}/backups"
+LOCAL_NODE_DIR="${STATE_DIR}/node"
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 LOCAL_BIN="${HOME}/.local/bin"
@@ -92,6 +98,7 @@ Options:
   --uninstall      撤销 powerkey 的配置改动（还原备份、删本地状态）
   --no-launch      装完不自动拉起 claude
   --force          忽略本地已领记录，强制重新领取
+  --cn             强制走国内镜像源装 Claude Code（不连 github/claude.ai）
   --key TOKEN      直接用这个 apiget key，跳过自动发码
   --base-url URL   覆盖 apiget API base（默认 https://api.apiget.cc）
   --issuer URL     覆盖发码服务端点（默认 https://get.apiget.cc）
@@ -102,7 +109,7 @@ EOF
 }
 
 # -------- 参数 --------
-DRY_RUN=0; DO_UNINSTALL=0; NO_LAUNCH=0; FORCE=0
+DRY_RUN=0; DO_UNINSTALL=0; NO_LAUNCH=0; FORCE=0; CN=0
 ISSUER="$DEFAULT_ISSUER"; BASE_URL=""; MODEL=""; SUPPLIED_KEY=""
 SOURCE_TAG="powerkey"; REF=""; CHANNEL=""
 while [ $# -gt 0 ]; do
@@ -111,6 +118,7 @@ while [ $# -gt 0 ]; do
     --uninstall) DO_UNINSTALL=1 ;;
     --no-launch) NO_LAUNCH=1 ;;
     --force)     FORCE=1 ;;
+    --cn)        CN=1 ;;
     --key)       SUPPLIED_KEY="${2:-}"; shift ;;
     --base-url)  BASE_URL="${2:-}"; shift ;;
     --issuer)    ISSUER="${2:-}"; shift ;;
@@ -159,7 +167,7 @@ PY
 print_banner() {
   log ""
   log "${C_BOLD}${C_CYAN}powerkey${C_RESET}  —  一键装 Claude Code · 接 apiget.cc"
-  log "${C_DIM}v${POWERKEY_VERSION}$([ "$DRY_RUN" = 1 ] && printf ' (dry-run)')${C_RESET}"
+  log "${C_DIM}v${POWERKEY_VERSION}$([ "$DRY_RUN" = 1 ] && printf ' (dry-run)')$([ "$CN" = 1 ] && printf ' (cn)')${C_RESET}"
   log ""
 }
 
@@ -168,7 +176,7 @@ preflight() {
   local os; os="$(detect_os)"
   [ "$os" = unknown ] && die "本脚本支持 macOS / Linux。Windows 请用 install.ps1。"
   has_cmd python3 || has_cmd jq || warn "未检测到 python3 或 jq：仅在 settings.json 不存在时能安全写入；建议装其一。"
-  info "环境：$os/$(detect_arch)"
+  info "环境：$os/$(detect_arch)$([ "$CN" = 1 ] && printf '（国内镜像模式）')"
 }
 
 # 探测/清理会覆盖 settings.json 的 shell ANTHROPIC_* 导出（shell env 优先级高于 settings.json）
@@ -215,22 +223,72 @@ PY
 
 claude_path() { command -v claude 2>/dev/null || { [ -x "$LOCAL_BIN/claude" ] && echo "$LOCAL_BIN/claude"; }; }
 
+# 确保 ~/.local/bin 在 PATH（原生安装 / npm --prefix 都装到这里）；并写进 rc 供新终端
+ensure_local_bin_path() {
+  case ":${PATH}:" in *":${LOCAL_BIN}:"*) ;; *) export PATH="${LOCAL_BIN}:$PATH" ;; esac
+  local rc="${HOME}/.zshrc"; [ -f "${HOME}/.bashrc" ] && rc="${HOME}/.bashrc"
+  if ! grep -q 'powerkey-path' "$rc" 2>/dev/null; then
+    printf '\n# powerkey-path\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc" 2>/dev/null || true
+  fi
+}
+
+# 没有 Node 时，从国内镜像下一个（免 sudo、免 GitHub），软链 node/npm 进 ~/.local/bin
+ensure_node_cn() {
+  has_cmd npm && return 0
+  local os arch nodeos nodearch dir pkg url
+  os="$(detect_os)"; arch="$(detect_arch)"
+  case "$os" in darwin) nodeos=darwin ;; linux) nodeos=linux ;; *) die "不支持的系统自动装 Node。" ;; esac
+  case "$arch" in x86_64|amd64) nodearch=x64 ;; aarch64|arm64) nodearch=arm64 ;; *) die "不支持的架构自动装 Node：${arch}。" ;; esac
+  dir="node-${NODE_VER}-${nodeos}-${nodearch}"; pkg="${dir}.tar.gz"; url="${NODE_CN_MIRROR}/${NODE_VER}/${pkg}"
+  info "未检测到 Node，正从国内镜像装 Node ${NODE_VER}…"
+  mkdir -p "$LOCAL_NODE_DIR" "$LOCAL_BIN"
+  curl -fsSL --max-time 180 "$url" -o "${LOCAL_NODE_DIR}/${pkg}" || die "下载 Node 失败：$url"
+  tar -xzf "${LOCAL_NODE_DIR}/${pkg}" -C "$LOCAL_NODE_DIR" || die "解压 Node 失败。"
+  rm -f "${LOCAL_NODE_DIR}/${pkg}"
+  ln -sf "${LOCAL_NODE_DIR}/${dir}/bin/node" "${LOCAL_BIN}/node"
+  ln -sf "${LOCAL_NODE_DIR}/${dir}/bin/npm"  "${LOCAL_BIN}/npm"
+  ln -sf "${LOCAL_NODE_DIR}/${dir}/bin/npx"  "${LOCAL_BIN}/npx"
+  export PATH="${LOCAL_NODE_DIR}/${dir}/bin:${LOCAL_BIN}:$PATH"
+  has_cmd npm || die "Node 装好但 npm 不可用。"
+  ok "Node ${NODE_VER} 已装到 ${LOCAL_NODE_DIR}。"
+}
+
+# 经国内镜像（npmmirror）装 Claude Code 到 ~/.local（无 sudo、不连 github/claude.ai）
+cc_install_cn() {
+  ensure_node_cn
+  info "经国内镜像（npmmirror）安装 Claude Code…"
+  npm install -g @anthropic-ai/claude-code@latest --registry="$NPM_CN_REGISTRY" --prefix "$HOME/.local" \
+    || die "国内镜像安装 Claude Code 失败。"
+}
+
+# 官方源装 Claude Code（海外路径）；失败/未生成 claude 则回退国内镜像
+cc_install_native_or_cn() {
+  local tmp; tmp="$(mktemp)"
+  if curl -fsSL --max-time 25 "$CLAUDE_INSTALL_URL" -o "$tmp" && [ -s "$tmp" ] && bash "$tmp"; then
+    rm -f "$tmp"; ensure_local_bin_path
+    [ -n "$(claude_path)" ] && return 0
+    warn "官方源装完但未找到 claude，回退国内镜像…"
+  else
+    rm -f "$tmp"; warn "官方源安装失败（可能国内网络不通 claude.ai），改用国内镜像 npmmirror…"
+  fi
+  cc_install_cn
+}
+
 ensure_claude_code() {
   export PATH="$LOCAL_BIN:$PATH"
   local existing; existing="$(claude_path)"
   if [ -n "$existing" ]; then
     info "已装 Claude Code（$("$existing" --version 2>/dev/null | head -n1)），尝试升级…"
     [ "$DRY_RUN" = 1 ] && { ok "[dry-run] 跳过升级"; return 0; }
-    "$existing" update >/dev/null 2>&1 || curl -fsSL "$CLAUDE_INSTALL_URL" | bash >/dev/null 2>&1 || warn "升级未成功，沿用现有版本。"
+    if [ "$CN" = 1 ]; then cc_install_cn || warn "升级未成功，沿用现有版本。"
+    else "$existing" update >/dev/null 2>&1 || warn "升级未成功，沿用现有版本。"; fi
     ok "Claude Code 就绪。"; return 0
   fi
   info "未检测到 Claude Code，安装最新版…"
-  [ "$DRY_RUN" = 1 ] && { ok "[dry-run] 将执行：curl -fsSL $CLAUDE_INSTALL_URL | bash"; return 0; }
-  if curl -fsSL "$CLAUDE_INSTALL_URL" | bash; then :
-  elif has_cmd npm; then warn "原生安装失败，改用 npm…"; npm install -g @anthropic-ai/claude-code@latest || die "Claude Code 安装失败。"
-  else die "Claude Code 安装失败且无 npm。请装 Node 后重试，或见 https://code.claude.com/docs/en/setup"; fi
-  export PATH="$LOCAL_BIN:$PATH"
-  [ -n "$(claude_path)" ] || warn "已安装但 PATH 未含 claude；可能需把 $LOCAL_BIN 加入 PATH。"
+  if [ "$DRY_RUN" = 1 ]; then ok "[dry-run] 将安装 Claude Code（CN=${CN}：1=国内镜像 npmmirror；0=官方源失败再回退国内镜像）"; return 0; fi
+  if [ "$CN" = 1 ]; then cc_install_cn; else cc_install_native_or_cn; fi
+  ensure_local_bin_path
+  [ -n "$(claude_path)" ] || warn "已安装但 PATH 未含 claude；新开终端，或把 ${LOCAL_BIN} 加入 PATH。"
   ok "Claude Code 安装完成。"
 }
 
@@ -300,14 +358,16 @@ obtain_token() {
   save_state; ok "已领到 \$${QUOTA_USD} 体验额度。"
 }
 
-# 合并写入 settings.json 的 env 块（保留其它字段；先备份）
+# 合并写入 settings.json 的 env 块（保留其它字段；先备份）。
+# 关掉 CC 非必要外联（遥测/上报/非必要流量）—— 国内裸机防卡的关键。
 apply_settings() {
   if [ "$DRY_RUN" = 1 ]; then
     info "[dry-run] 将写入 $SETTINGS_FILE 的 env："
     log "    ANTHROPIC_BASE_URL=$BASE_URL"
     log "    ANTHROPIC_AUTH_TOKEN=${TOKEN%%-*}-****"
     log "    ANTHROPIC_MODEL=$MODEL ; ANTHROPIC_DEFAULT_HAIKU_MODEL=$MODEL"
-    log "    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ; DISABLE_TELEMETRY=1"
+    log "    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1"
+    log "    DISABLE_TELEMETRY=1 ; DISABLE_ERROR_REPORTING=1 ; CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
     return 0
   fi
   mkdir -p "$CLAUDE_DIR"
@@ -318,7 +378,8 @@ import json, os
 p=os.environ["PK_F"]
 newenv={"ANTHROPIC_BASE_URL":os.environ["PK_B"],"ANTHROPIC_AUTH_TOKEN":os.environ["PK_T"],
         "ANTHROPIC_MODEL":os.environ["PK_M"],"ANTHROPIC_DEFAULT_HAIKU_MODEL":os.environ["PK_M"],
-        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","DISABLE_TELEMETRY":"1"}
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","DISABLE_TELEMETRY":"1",
+        "DISABLE_ERROR_REPORTING":"1","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"}
 data={}
 if os.path.exists(p):
     try: data=json.load(open(p)) or {}
@@ -330,13 +391,13 @@ json.dump(data, open(p,"w"), indent=2, ensure_ascii=False); open(p,"a").write("\
 PY
   elif has_cmd jq; then
     local ne tmp; tmp="$(mktemp)"
-    ne="$(jq -n --arg b "$BASE_URL" --arg t "$TOKEN" --arg m "$MODEL" '{ANTHROPIC_BASE_URL:$b,ANTHROPIC_AUTH_TOKEN:$t,ANTHROPIC_MODEL:$m,ANTHROPIC_DEFAULT_HAIKU_MODEL:$m,CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY:"1",DISABLE_TELEMETRY:"1"}')"
+    ne="$(jq -n --arg b "$BASE_URL" --arg t "$TOKEN" --arg m "$MODEL" '{ANTHROPIC_BASE_URL:$b,ANTHROPIC_AUTH_TOKEN:$t,ANTHROPIC_MODEL:$m,ANTHROPIC_DEFAULT_HAIKU_MODEL:$m,CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY:"1",DISABLE_TELEMETRY:"1",DISABLE_ERROR_REPORTING:"1",CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:"1"}')"
     if [ -f "$SETTINGS_FILE" ]; then jq --argjson ne "$ne" '.env = ((.env // {}) + $ne)' "$SETTINGS_FILE" > "$tmp" || die "jq 合并 settings.json 失败（JSON 损坏？）。"
     else printf '%s' "$ne" | jq '{env: .}' > "$tmp"; fi
     mv "$tmp" "$SETTINGS_FILE"
   else
     [ -f "$SETTINGS_FILE" ] && die "已有 settings.json，需 python3 或 jq 才能安全合并。请装其一后重试。"
-    printf '{\n  "env": {\n    "ANTHROPIC_BASE_URL": "%s",\n    "ANTHROPIC_AUTH_TOKEN": "%s",\n    "ANTHROPIC_MODEL": "%s",\n    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "%s",\n    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",\n    "DISABLE_TELEMETRY": "1"\n  }\n}\n' "$BASE_URL" "$TOKEN" "$MODEL" "$MODEL" > "$SETTINGS_FILE"
+    printf '{\n  "env": {\n    "ANTHROPIC_BASE_URL": "%s",\n    "ANTHROPIC_AUTH_TOKEN": "%s",\n    "ANTHROPIC_MODEL": "%s",\n    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "%s",\n    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",\n    "DISABLE_TELEMETRY": "1",\n    "DISABLE_ERROR_REPORTING": "1",\n    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"\n  }\n}\n' "$BASE_URL" "$TOKEN" "$MODEL" "$MODEL" > "$SETTINGS_FILE"
   fi
   chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
   ok "已写入 ${SETTINGS_FILE}（合并保留你的其它设置）。"
@@ -380,7 +441,7 @@ p=os.environ["PK_F"]
 try: data=json.load(open(p)) or {}
 except Exception: raise SystemExit(1)
 env=data.get("env") or {}
-for k in ("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY","DISABLE_TELEMETRY"):
+for k in ("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY","DISABLE_TELEMETRY","DISABLE_ERROR_REPORTING","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"):
     env.pop(k,None)
 if env: data["env"]=env
 else: data.pop("env",None)

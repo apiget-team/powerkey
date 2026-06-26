@@ -53,3 +53,19 @@ jobs:
           $tout = (claude --dangerously-skip-permissions -p "Run the shell command: echo hello-from-tool -- then reply only its exact stdout." 2>&1) -join ' '; M ("tool-out: " + $tout.Substring(0, [Math]::Min(240, $tout.Length)))
           if ($tout -match 'hello-from-tool') { M "tool OK" } else { M "tool FAIL"; $fail = 1 }
           M "RESULT FAIL=$fail"; if ($fail -ne 0) { exit 1 }
+
+  cn:
+    name: ubuntu-cn (npmmirror)
+    runs-on: ubuntu-latest
+    steps:
+      - name: install --cn (force npmmirror) + smoke
+        run: |
+          set +e; FAIL=0; m(){ echo "SMOKE: $*"; }
+          m "A install --cn (force npmmirror, no github/claude.ai)"
+          curl -fsSL https://get.apiget.cc | bash -s -- --cn --no-launch || { m "install FAIL"; FAIL=1; }
+          export PATH="$HOME/.local/bin:$PATH"
+          { grep -q api.apiget.cc "$HOME/.claude/settings.json" && grep -q deepseek-v4-pro "$HOME/.claude/settings.json"; } && m "settings OK" || { m "settings FAIL"; FAIL=1; }
+          claude --version && m "claude-installed OK ($(claude --version 2>/dev/null | head -1))" || { m "claude-installed FAIL"; FAIL=1; }
+          OUT=$(claude -p "Reply with exactly one word: PONG" 2>&1); m "basic-out: $(echo "$OUT" | tr -d '\n' | cut -c1-160)"
+          echo "$OUT" | grep -qi PONG && m "basic OK" || { m "basic FAIL"; FAIL=1; }
+          m "RESULT FAIL=$FAIL"; [ "$FAIL" = 0 ]

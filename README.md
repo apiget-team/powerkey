@@ -34,6 +34,7 @@ curl -fsSL https://get.apiget.cc | bash -s -- [options]
 | `--uninstall` | 撤销 powerkey 的配置改动（还原 `settings.json` 备份、删本地状态） |
 | `--no-launch` | 装完不自动拉起 `claude` |
 | `--force` | 忽略本机已领记录，强制重新领取 |
+| `--cn` | 强制走国内镜像源装 Claude Code（不连 github/claude.ai） |
 | `--key TOKEN` | 直接用这个 apiget key（教程派发场景），跳过自动发码 |
 | `--base-url URL` | 覆盖 apiget API base（默认 `https://api.apiget.cc`） |
 | `--issuer URL` | 覆盖发码服务端点（默认 `https://get.apiget.cc`） |
@@ -52,6 +53,18 @@ curl -fsSL https://get.apiget.cc | bash -s -- [options]
 ## 默认模型 & 切换
 
 默认 `deepseek-v4-pro`。想用更强的：进入 `claude` 后输入 `/model`，因为脚本开了 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`，会列出 apiget 网关上的全部模型（Claude / Gemini / GPT…）任你切。
+
+## 国内网络（不挂梯子）
+
+脚本与发码都走 `get.apiget.cc`（国内直连）。装 Claude Code 时：官方源（claude.ai）拉不动会**自动回退国内镜像 npmmirror**；也可显式 `--cn` 直接走镜像。没有 Node 会从 npmmirror 下一个（免 sudo、免 GitHub）。并默认关掉 Claude Code 的非必要外联（遥测/上报/非必要流量），避免国内裸机卡在够不到的地址。
+
+```bash
+curl -fsSL https://get.apiget.cc | bash -s -- --cn      # 强制国内镜像
+```
+
+## cc-switch
+
+powerkey **不安装 cc-switch** —— 它直接写 `~/.claude/settings.json`，Claude Code 就读这份，不装 cc-switch 也能用。若你已装 cc-switch（GUI 切换器），脚本会提示：之后在 cc-switch 里切 provider 会覆盖本配置，需在它的 GUI 里也加一个 apiget provider。
 
 ## 安全
 
