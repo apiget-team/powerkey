@@ -47,6 +47,9 @@ $NodeDir         = Join-Path $StateDir 'node'
 $ClaudeDir       = Join-Path $HOME '.claude'
 $SettingsFile    = Join-Path $ClaudeDir 'settings.json'
 $LocalBin        = Join-Path $HOME '.local\bin'
+$CcSwitchDir     = Join-Path $HOME '.cc-switch'
+$CcSwitchDb      = Join-Path $CcSwitchDir 'cc-switch.db'
+$CcSwitchSettings = Join-Path $CcSwitchDir 'settings.json'
 
 # -------- 日志 --------
 function Info($m) { Write-Host "▸ $m" -ForegroundColor Cyan }
@@ -222,6 +225,45 @@ function Set-Settings($base, $token, $model) {
   Ok "已写入 ${SettingsFile}（合并保留你的其它设置）。"
 }
 
+# 若已装 cc-switch：把 apiget 写进它（provider + 设为当前）。需 python（含内置 sqlite3）；无则回退提示。
+function Set-CcSwitch($base, $token, $model) {
+  if (-not ((Test-Path $CcSwitchDb) -or (Test-Path $CcSwitchDir))) { return }
+  Info '检测到 cc-switch。'
+  if ($DryRun) { Info '[dry-run] 将把 apiget 写进 cc-switch（provider + 设为当前）。'; return }
+  if (-not (Test-Path $CcSwitchDb)) { Warn 'cc-switch 已装但未见数据库（首次启动后才生成）；settings.json 已直写，启动后可手动加 apiget。'; return }
+  $py = Get-Command python3 -ErrorAction SilentlyContinue; if (-not $py) { $py = Get-Command python -ErrorAction SilentlyContinue }
+  if (-not $py) { Warn 'cc-switch 已装但无 python；跳过写其 DB，settings.json 已直写，可在 cc-switch 界面手动加 apiget。'; return }
+  Copy-Item $CcSwitchDb "$CcSwitchDb.powerkey-bak.$(Get-Date -Format yyyyMMddHHmmss)" -ErrorAction SilentlyContinue
+  $env:PK_DB = $CcSwitchDb; $env:PK_SET = $CcSwitchSettings; $env:PK_B = $base; $env:PK_T = $token; $env:PK_M = $model
+  $script = @'
+import sqlite3, json, os, time
+db = os.environ["PK_DB"]; setp = os.environ["PK_SET"]
+env = {"ANTHROPIC_BASE_URL": os.environ["PK_B"], "ANTHROPIC_AUTH_TOKEN": os.environ["PK_T"],
+       "ANTHROPIC_MODEL": os.environ["PK_M"], "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.environ["PK_M"],
+       "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "DISABLE_TELEMETRY": "1",
+       "DISABLE_ERROR_REPORTING": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+sc = json.dumps({"env": env}, ensure_ascii=False)
+con = sqlite3.connect(db, timeout=5); cur = con.cursor()
+cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='providers'")
+if not cur.fetchone(): raise SystemExit(3)
+ts = int(time.time() * 1000)
+cur.execute("INSERT OR REPLACE INTO providers (id,app_type,name,settings_config,category,created_at,sort_index,meta,is_current) VALUES ('apiget','claude','API GET',?,?,?,?,?,1)", (sc, 'custom', ts, 0, '{}'))
+cur.execute("UPDATE providers SET is_current=0 WHERE app_type='claude' AND id!='apiget'")
+con.commit(); con.close()
+s = {}
+if os.path.exists(setp):
+    try: s = json.load(open(setp)) or {}
+    except Exception: s = {}
+if not isinstance(s, dict): s = {}
+s["current_provider_claude"] = "apiget"
+os.makedirs(os.path.dirname(setp), exist_ok=True)
+json.dump(s, open(setp, "w"), indent=2, ensure_ascii=False)
+'@
+  $script | & $py.Source -
+  if ($LASTEXITCODE -eq 0) { Ok '已把 apiget 写进 cc-switch（provider + 设为当前）。重启 cc-switch 可见可切换。' }
+  else { Warn '写 cc-switch 失败；settings.json 已直写、claude 仍可用，可在 cc-switch 界面手动加 apiget。' }
+}
+
 function Show-Ready($base, $model, $quota) {
   Write-Host ''
   Ok '就绪！'
@@ -260,6 +302,7 @@ Test-ConflictingEnv
 Install-ClaudeCode
 $t = Get-IssuedToken
 Set-Settings $t.base $t.token $t.model
+Set-CcSwitch $t.base $t.token $t.model
 Show-Ready $t.base $t.model $t.quota
 
 if (-not $DryRun -and -not $NoLaunch) {

@@ -64,7 +64,9 @@ curl -fsSL https://get.apiget.cc | bash -s -- --cn      # 强制国内镜像
 
 ## cc-switch
 
-powerkey **不安装 cc-switch** —— 它直接写 `~/.claude/settings.json`，Claude Code 就读这份，不装 cc-switch 也能用。若你已装 cc-switch（GUI 切换器），脚本会提示：之后在 cc-switch 里切 provider 会覆盖本配置，需在它的 GUI 里也加一个 apiget provider。
+powerkey **不安装 cc-switch**（它直接写 `~/.claude/settings.json`，不装也能用）。但**若检测到你已装 cc-switch，会自动把 apiget 写进去**：在它的 providers 里加一个「API GET」并**设为当前**（同时直写 `settings.json`，立即可用）。重启 cc-switch 就能在列表里看到、随时切换，也不会被下次切换覆盖。
+
+机制：写 cc-switch 的 SQLite（`~/.cc-switch/cc-switch.db` 的 `providers` 表）+ `~/.cc-switch/settings.json` 的 `current_provider_claude`，用 `python3` 内置 sqlite3（无外部依赖）。写前自动备份其 DB。Windows 上若无 python 则回退为只写 `settings.json` + 提示手动添加。
 
 ## 安全
 

@@ -65,6 +65,33 @@ printf 'export ANTHROPIC_BASE_URL=https://example\n' > "$HOME/.bashrc"
 OUT="$( DRY_RUN=1; detect_conflicting_env 2>&1 )"
 if printf '%s' "$OUT" | grep -q 'ANTHROPIC_\|启动文件'; then _ok "探测到 rc 中的冲突变量"; else _no "探测到 rc 中的冲突变量"; fi
 
+echo "[configure_cc_switch — 写进 cc-switch DB + 设当前]"
+mkdir -p "$HOME/.cc-switch"
+python3 - <<'PY'
+import sqlite3, os
+p = os.path.expanduser("~/.cc-switch/cc-switch.db")
+con = sqlite3.connect(p)
+con.execute("CREATE TABLE providers (id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, settings_config TEXT NOT NULL, website_url TEXT, category TEXT, created_at INTEGER, sort_index INTEGER, notes TEXT, icon TEXT, icon_color TEXT, meta TEXT NOT NULL DEFAULT '{}', is_current BOOLEAN NOT NULL DEFAULT 0, in_failover_queue BOOLEAN NOT NULL DEFAULT 0, PRIMARY KEY (id, app_type))")
+con.execute("INSERT INTO providers (id,app_type,name,settings_config,is_current) VALUES ('default','claude','Default','{}',1)")
+con.commit(); con.close()
+PY
+TOKEN="sk-ccs-777"; BASE_URL="https://api.apiget.cc"; MODEL="deepseek-v4-pro"; DRY_RUN=0
+configure_cc_switch >/dev/null 2>&1
+if python3 - <<'PY'
+import sqlite3, os, sys
+r = sqlite3.connect(os.path.expanduser("~/.cc-switch/cc-switch.db")).execute("SELECT settings_config,is_current FROM providers WHERE id='apiget' AND app_type='claude'").fetchone()
+sys.exit(0 if r and r[1]==1 and 'sk-ccs-777' in r[0] and 'deepseek-v4-pro' in r[0] else 1)
+PY
+then _ok "apiget provider 写入(is_current=1 + token + model)"; else _no "apiget provider 写入"; fi
+if python3 - <<'PY'
+import sqlite3, os, sys
+r = sqlite3.connect(os.path.expanduser("~/.cc-switch/cc-switch.db")).execute("SELECT is_current FROM providers WHERE id='default'").fetchone()
+sys.exit(0 if r and r[0]==0 else 1)
+PY
+then _ok "旧 default 置为非当前"; else _no "旧 default 置为非当前"; fi
+t_has "settings.json 写 current_provider_claude" "$HOME/.cc-switch/settings.json" 'current_provider_claude'
+t_has "settings.json 值为 apiget" "$HOME/.cc-switch/settings.json" 'apiget'
+
 echo
 echo "结果：PASS=$_pass  FAIL=$_fail"
 [ "$_fail" -eq 0 ]

@@ -55,6 +55,9 @@ LOCAL_NODE_DIR="${STATE_DIR}/node"
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 LOCAL_BIN="${HOME}/.local/bin"
+CC_SWITCH_DIR="${HOME}/.cc-switch"
+CC_SWITCH_DB="${CC_SWITCH_DIR}/cc-switch.db"
+CC_SWITCH_SETTINGS="${CC_SWITCH_DIR}/settings.json"
 
 TOKEN=""
 QUOTA_USD="2"
@@ -403,11 +406,48 @@ PY
   ok "已写入 ${SETTINGS_FILE}（合并保留你的其它设置）。"
 }
 
-detect_cc_switch() {
-  if [ -e "$HOME/.cc-switch/cc-switch.db" ] || [ -d "$HOME/.cc-switch" ] || [ -d "/Applications/CC Switch.app" ]; then
-    warn "检测到 cc-switch：已直接写 ~/.claude/settings.json（CC 实际读这份，cc-switch 切换时也写它）。"
-    warn "  注意：若你之后在 cc-switch 里切 provider，会覆盖本配置——请在 cc-switch 里也加一个 apiget provider 以便保留。"
-  fi
+# 把 apiget 写进已装的 cc-switch（providers 表加一行 + 设为当前），让它成为可切换的正式 provider。
+# cc-switch SQLite: ~/.cc-switch/cc-switch.db(providers 表, app_type=claude, settings_config=env JSON, is_current)
+# + ~/.cc-switch/settings.json 的 current_provider_claude 覆盖 is_current —— 两处都设。用 python3 内置 sqlite3（无外部依赖）。
+configure_cc_switch() {
+  cp "$CC_SWITCH_DB" "${CC_SWITCH_DB}.powerkey-bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)" 2>/dev/null || true
+  PK_DB="$CC_SWITCH_DB" PK_SET="$CC_SWITCH_SETTINGS" PK_B="$BASE_URL" PK_T="$TOKEN" PK_M="$MODEL" python3 - <<'PY'
+import sqlite3, json, os, time
+db=os.environ["PK_DB"]; setp=os.environ["PK_SET"]
+env={"ANTHROPIC_BASE_URL":os.environ["PK_B"],"ANTHROPIC_AUTH_TOKEN":os.environ["PK_T"],
+     "ANTHROPIC_MODEL":os.environ["PK_M"],"ANTHROPIC_DEFAULT_HAIKU_MODEL":os.environ["PK_M"],
+     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","DISABLE_TELEMETRY":"1",
+     "DISABLE_ERROR_REPORTING":"1","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"}
+sc=json.dumps({"env":env}, ensure_ascii=False)
+con=sqlite3.connect(db, timeout=5); cur=con.cursor()
+cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='providers'")
+if not cur.fetchone(): raise SystemExit(3)
+ts=int(time.time()*1000)
+cur.execute("INSERT OR REPLACE INTO providers (id,app_type,name,settings_config,category,created_at,sort_index,meta,is_current) VALUES ('apiget','claude','API GET',?,?,?,?,?,1)", (sc,'custom',ts,0,'{}'))
+cur.execute("UPDATE providers SET is_current=0 WHERE app_type='claude' AND id!='apiget'")
+con.commit(); con.close()
+s={}
+if os.path.exists(setp):
+    try: s=json.load(open(setp)) or {}
+    except Exception: s={}
+if not isinstance(s,dict): s={}
+s["current_provider_claude"]="apiget"
+os.makedirs(os.path.dirname(setp), exist_ok=True)
+json.dump(s, open(setp,"w"), indent=2, ensure_ascii=False)
+PY
+  local rc=$?
+  if [ "$rc" = 0 ]; then ok "已把 apiget 写进 cc-switch（provider + 设为当前）；重启 cc-switch 即可见可切换。"
+  else warn "写 cc-switch 失败（rc=${rc}）；settings.json 已直写、claude 仍可用，可在 cc-switch 界面手动加 apiget。"; fi
+}
+
+# 检测到已装 cc-switch：脚本化配置它（加 apiget provider + 设为当前），而非只警告
+handle_cc_switch() {
+  { [ -e "$CC_SWITCH_DB" ] || [ -d "$CC_SWITCH_DIR" ] || [ -d "/Applications/CC Switch.app" ]; } || return 0
+  info "检测到 cc-switch。"
+  [ "$DRY_RUN" = 1 ] && { info "[dry-run] 将把 apiget 写进 cc-switch（provider + 设为当前）。"; return 0; }
+  [ -f "$CC_SWITCH_DB" ] || { warn "cc-switch 已装但未见数据库（首次启动后才生成）；settings.json 已直写，启动 cc-switch 后可手动加 apiget。"; return 0; }
+  has_cmd python3 || { warn "cc-switch 已装但无 python3，跳过写其 DB；settings.json 已直写，可在 cc-switch 界面手动加 apiget。"; return 0; }
+  configure_cc_switch
 }
 
 print_ready() {
@@ -461,7 +501,7 @@ main() {
   ensure_claude_code
   obtain_token
   apply_settings
-  detect_cc_switch
+  handle_cc_switch
   print_ready
   maybe_launch
 }
