@@ -283,12 +283,16 @@ cc_install_cn() {
 # 官方源装 Claude Code（海外路径）；失败/未生成 claude 则回退国内镜像
 cc_install_native_or_cn() {
   local tmp; tmp="$(mktemp)"
-  if curl -fsSL --max-time 25 "$CLAUDE_INSTALL_URL" -o "$tmp" && [ -s "$tmp" ] && bash "$tmp"; then
+  # 国内 claude.ai 常返「区域不可用」HTML（302→HTML）：别把 HTML 当脚本 bash（会喷 syntax error + 整页 HTML）；
+  # 检测到 HTML 直接当失败、干净回退 npmmirror。
+  if curl -fsSL --max-time 25 "$CLAUDE_INSTALL_URL" -o "$tmp" && [ -s "$tmp" ] \
+     && ! head -c 256 "$tmp" | grep -qiE '<!doctype|<html|unavailable in region|app-unavailable' \
+     && bash "$tmp"; then
     rm -f "$tmp"; ensure_local_bin_path
     [ -n "$(claude_path)" ] && return 0
     warn "官方源装完但未找到 claude，回退国内镜像…"
   else
-    rm -f "$tmp"; warn "官方源安装失败（可能国内网络不通 claude.ai），改用国内镜像 npmmirror…"
+    rm -f "$tmp"; warn "官方源不可用（国内网络/区域限制，claude.ai 不可达），改用国内镜像 npmmirror…"
   fi
   cc_install_cn
 }
@@ -485,7 +489,7 @@ print_ready() {
   log "  额度：${C_BOLD}\$${QUOTA_USD}${C_RESET} 体验额度    默认模型：${C_BOLD}${MODEL}${C_RESET}    中转：${BASE_URL}"
   log ""
   log "  ${C_DIM}已配好 apiget 中转，${C_RESET}${C_BOLD}无需登录 Anthropic 账号（别走 /login）${C_RESET}${C_DIM}，直接对话即可。${C_RESET}"
-  log "  ${C_DIM}进对话后输入${C_RESET} ${C_BOLD}/status${C_RESET} ${C_DIM}确认中转已生效；${C_RESET}${C_BOLD}/model${C_RESET} ${C_DIM}可切 Claude / Gemini 等（已开网关模型发现）。${C_RESET}"
+  log "  ${C_DIM}进对话后输入${C_RESET} ${C_BOLD}/status${C_RESET} ${C_DIM}确认中转已生效；${C_RESET}${C_BOLD}/model${C_RESET} ${C_DIM}可切换网关在售的其它模型（GPT / Gemini 等，已开网关模型发现）。${C_RESET}"
   log "  ${C_DIM}没自动启动？运行${C_RESET} ${C_BOLD}claude${C_RESET}${C_DIM}（若提示找不到，新开终端或 export PATH=\$HOME/.local/bin:\$PATH）。${C_RESET}"
   log "  ${C_DIM}想长期用 / 要更多额度？注册：${C_RESET}${REGISTER_URL}"
   log ""

@@ -96,19 +96,29 @@ function Show-Banner {
 }
 
 function Test-ConflictingEnv {
-  $vars = 'ANTHROPIC_BASE_URL','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL'
+  $vars = 'ANTHROPIC_BASE_URL','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL','ANTHROPIC_SMALL_FAST_MODEL'
   $hit = @()
   foreach ($v in $vars) {
     if ([Environment]::GetEnvironmentVariable($v, 'User') -or [Environment]::GetEnvironmentVariable($v, 'Process')) { $hit += $v }
   }
   if ($hit.Count -eq 0) { return }
   Warn "检测到已有 ANTHROPIC_* 环境变量（优先级高于 settings.json，会让配置不生效）：$($hit -join ', ')"
-  if (-not $DryRun) {
-    foreach ($v in $hit) {
-      [Environment]::SetEnvironmentVariable($v, $null, 'User')
-      Remove-Item "Env:$v" -ErrorAction SilentlyContinue
-    }
-    Ok '已清除冲突的 User/Process 级 ANTHROPIC_* 变量。'
+  if ($DryRun) { return }
+  # 先备份这些 User 级变量的值（可恢复），再按确认清理；非交互默认不删，绝不静默破坏用户环境
+  New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
+  $bak = Join-Path $BackupDir ("anthropic-env.bak." + (Get-Date -Format yyyyMMddHHmmss) + ".ps1")
+  foreach ($v in $hit) {
+    $uval = [Environment]::GetEnvironmentVariable($v, 'User')
+    if ($null -ne $uval) { ("[Environment]::SetEnvironmentVariable('{0}', '{1}', 'User')" -f $v, ($uval -replace "'","''")) | Add-Content -Path $bak }
+  }
+  Write-Host "  已备份原值到 $bak（要恢复就运行它）。" -ForegroundColor DarkGray
+  $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+  $ans = if ($interactive) { Read-Host "清除这些 User 级变量以让中转生效？(y/N)" } else { '' }
+  if ($ans -match '^[Yy]') {
+    foreach ($v in $hit) { [Environment]::SetEnvironmentVariable($v, $null, 'User'); Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+    Ok '已清除冲突的 User 级 ANTHROPIC_* 变量（备份见上，可恢复）。'
+  } else {
+    Warn '未清除（非交互或你选了 N）。若配置不生效，手动删这些 User 级变量；备份可恢复。'
   }
 }
 
@@ -287,7 +297,7 @@ function Show-Ready($base, $model, $quota) {
   Write-Host "  额度：`$$quota 体验额度    默认模型：$model    中转：$base"
   Write-Host ''
   Write-Host "  已配好 apiget 中转，无需登录 Anthropic 账号（别走 /login），直接对话即可。" -ForegroundColor DarkGray
-  Write-Host "  进对话后输入 /status 确认中转已生效；/model 可切 Claude / Gemini 等（已开网关模型发现）。" -ForegroundColor DarkGray
+  Write-Host "  进对话后输入 /status 确认中转已生效；/model 可切换网关在售的其它模型（GPT / Gemini 等，已开网关模型发现）。" -ForegroundColor DarkGray
   Write-Host "  想长期用 / 要更多额度？注册：$RegisterUrl" -ForegroundColor DarkGray
   Write-Host ''
 }
@@ -350,7 +360,8 @@ Show-Ready $t.base $t.model $t.quota
 
 if (-not $DryRun -and -not $NoLaunch) {
   $exe = Get-ClaudeExe
-  if ($exe) { Info '启动 claude …'; & $exe } else { Write-Host '运行 claude 开始体验。' }
+  $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+  if ($exe -and $interactive) { Info '启动 claude …'; & $exe } else { Write-Host '运行 claude 开始体验。' }
 } else {
   Write-Host '运行 claude 开始体验。'
 }

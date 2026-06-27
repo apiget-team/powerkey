@@ -13,7 +13,7 @@ curl -fsSL https://get.apiget.cc | bash
 1. 探测环境，**装 / 升级 Claude Code 到最新**（用官方安装器）
 2. 领 **$2 体验额度**（或用你拿到的 key：`--key <token>`）
 3. 写入 `~/.claude/settings.json` 的 `env` 块（**合并不覆盖**，并自动清理会冲突的旧 `ANTHROPIC_*` 环境变量）
-4. 默认模型 **DeepSeek V4 Pro**（不贵又好用，$2 够玩很久）；想试 Claude / Gemini，对话里输入 `/model` 切换
+4. 默认模型 **DeepSeek V4 Pro**（不贵又好用，$2 够玩很久）；想试更强的（GPT / Gemini 等），对话里输入 `/model` 切换（具体以网关在售为准）
 5. 交互终端下**直接拉起 `claude`**
 
 > 平台：v1 支持 **macOS / Linux**（`install.sh`）。Windows（`install.ps1`，PowerShell）紧随。
@@ -38,7 +38,7 @@ curl -fsSL https://get.apiget.cc | bash -s -- [options]
 | `--key TOKEN` | 直接用这个 apiget key（教程派发场景），跳过自动发码 |
 | `--base-url URL` | 覆盖 apiget API base（默认 `https://api.apiget.cc`） |
 | `--issuer URL` | 覆盖发码服务端点（默认 `https://get.apiget.cc`） |
-| `--ref CODE` | 推广 / 分销归因码（带进发码请求，归功到你名下） |
+| `--ref CODE` | 推广 / 分销归因码（带进发码请求，用于来源统计；佣金归因闭环开发中） |
 | `--source NAME` | 来源标签（默认 `powerkey`） |
 
 ## 它做了什么（设计）
@@ -52,7 +52,7 @@ curl -fsSL https://get.apiget.cc | bash -s -- [options]
 
 ## 默认模型 & 切换
 
-默认 `deepseek-v4-pro`。想用更强的：进入 `claude` 后输入 `/model`，因为脚本开了 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`，会列出 apiget 网关上的全部模型（Claude / Gemini / GPT…）任你切。
+默认 `deepseek-v4-pro`。想用更强的：进入 `claude` 后输入 `/model`，因为脚本开了 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`，会列出 apiget 网关上当前在售的模型（GPT / Gemini 等）任你切（具体可用以网关为准）。
 
 ## 国内网络（不挂梯子）
 
