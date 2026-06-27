@@ -28,9 +28,11 @@ jobs:
         run: LC_ALL=C bash test/test_install.sh
       - name: e2e (mock issuer)
         run: bash test/test_e2e.sh
+      - name: dry-run (no install, no network)
+        run: bash install.sh --dry-run --no-launch </dev/null
 
   powershell:
-    name: powershell parse
+    name: powershell (parse + dry-run + uninstall + behavioral)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +44,21 @@ jobs:
           [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\install.ps1), [ref]$tokens, [ref]$errs) | Out-Null
           if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_ }; exit 1 }
           Write-Host "install.ps1 parses OK"
+      - name: dry-run (no install, no network)
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          .\install.ps1 -DryRun -NoLaunch
+      - name: uninstall (clean no-op)
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          .\install.ps1 -Uninstall
+      - name: behavioral test (Set-Settings / uninstall)
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          .\test\test_install.ps1
 
   issuer:
     name: issuer (go)

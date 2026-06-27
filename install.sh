@@ -545,6 +545,7 @@ maybe_launch() {
 do_uninstall() {
   info "撤销 powerkey 的配置改动…"
   local restored=0 latest
+  # ① settings.json：优先还原备份，否则移除 powerkey 写入的 env 键
   if [ -d "$BACKUP_DIR" ]; then
     latest="$(ls -1t "$BACKUP_DIR"/settings.json.bak.* 2>/dev/null | head -n1)"
     [ -n "${latest:-}" ] && [ -f "$latest" ] && cp "$latest" "$SETTINGS_FILE" && { ok "已还原 settings.json（来自 ${latest}）。"; restored=1; }
@@ -563,8 +564,82 @@ else: data.pop("env",None)
 json.dump(data, open(p,"w"), indent=2, ensure_ascii=False); open(p,"a").write("\n")
 PY
   fi
+  # ② ~/.claude.json：skip_onboarding 改过它——有备份就还原；无备份则留着无害的 onboarding 标记
+  if [ -d "$BACKUP_DIR" ]; then
+    local cjbak; cjbak="$(ls -1t "$BACKUP_DIR"/claude.json.bak.* 2>/dev/null | head -n1)"
+    [ -n "${cjbak:-}" ] && [ -f "$cjbak" ] && cp "$cjbak" "${HOME}/.claude.json" 2>/dev/null && ok "已还原 ~/.claude.json（来自 ${cjbak}）。"
+  fi
+  # ③ shell 启动文件：删 ensure_local_bin_path 加的「# powerkey-path」块；反注释 detect_conflicting_env 注释掉的 ANTHROPIC_* 行
+  local rc rc_cleaned=0
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.zprofile" "$HOME/.profile"; do
+    [ -f "$rc" ] || continue
+    grep -qE 'powerkey-path|powerkey-disabled' "$rc" 2>/dev/null || continue
+    if has_cmd python3; then
+      PK_RC="$rc" python3 - <<'PY' 2>/dev/null && rc_cleaned=1
+import os
+p=os.environ["PK_RC"]
+pfx="# powerkey-disabled: "
+lines=open(p, encoding="utf-8", errors="replace").read().splitlines(keepends=True)
+out=[]; i=0; n=len(lines)
+while i < n:
+    l=lines[i]
+    if l.strip()=="# powerkey-path":
+        if out and out[-1].strip()=="": out.pop()       # 去掉我们加的前置空行
+        i+=1
+        if i < n and ".local/bin" in lines[i]: i+=1     # 删紧跟其后的 PATH export
+        continue
+    if l.startswith(pfx):
+        out.append(l[len(pfx):]); i+=1; continue          # 反注释：剥掉前缀还原原行
+    out.append(l); i+=1
+open(p,"w",encoding="utf-8").write("".join(out))
+PY
+    else
+      # 无 python3 的 awk 兜底（POSIX，BSD/GNU 通吃）：删标记+其后的 PATH export、反注释 disabled 行
+      awk '
+        /^# powerkey-path$/ { m=1; next }
+        m==1 { m=0; if (index($0,".local/bin")) next }
+        { sub(/^# powerkey-disabled: /, ""); print }
+      ' "$rc" > "$rc.pk.tmp" 2>/dev/null && mv "$rc.pk.tmp" "$rc" 2>/dev/null && rc_cleaned=1 || rm -f "$rc.pk.tmp" 2>/dev/null
+    fi
+  done
+  [ "$rc_cleaned" = 1 ] && ok "已清理 shell 启动文件里的 powerkey 改动（# powerkey-path 块 + 反注释 ANTHROPIC_* 行）。"
+  # ④ cc-switch（关键）：移除 apiget provider 行；若 current_provider_claude=apiget 则改回其它 claude provider（无则删键）。先备份 DB。
+  if [ -f "$CC_SWITCH_DB" ] && has_cmd python3; then
+    cp "$CC_SWITCH_DB" "${CC_SWITCH_DB}.powerkey-bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)" 2>/dev/null || true
+    PK_DB="$CC_SWITCH_DB" PK_SET="$CC_SWITCH_SETTINGS" python3 - <<'PY'
+import sqlite3, json, os
+db=os.environ["PK_DB"]; setp=os.environ["PK_SET"]
+s={}
+if os.path.exists(setp):
+    try: s=json.load(open(setp)) or {}
+    except Exception: s={}
+    if not isinstance(s,dict): s={}
+cur_is_apiget = (s.get("current_provider_claude")=="apiget")
+other=None
+con=sqlite3.connect(db, timeout=5); c=con.cursor()
+c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='providers'")
+if c.fetchone():
+    c.execute("DELETE FROM providers WHERE id='apiget' AND app_type='claude'")
+    if cur_is_apiget:
+        row=c.execute("SELECT id FROM providers WHERE app_type='claude' ORDER BY sort_index, created_at LIMIT 1").fetchone()
+        if row:
+            other=row[0]
+            c.execute("UPDATE providers SET is_current=CASE WHEN id=? THEN 1 ELSE 0 END WHERE app_type='claude'", (other,))
+    con.commit()
+con.close()
+if cur_is_apiget:
+    if other: s["current_provider_claude"]=other
+    else: s.pop("current_provider_claude", None)
+    d=os.path.dirname(setp)
+    if d: os.makedirs(d, exist_ok=True)
+    json.dump(s, open(setp,"w"), indent=2, ensure_ascii=False)
+PY
+    local crc=$?
+    if [ "$crc" = 0 ]; then ok "已从 cc-switch 移除 apiget provider（如曾设为当前则已改回其它 provider）。"
+    else warn "清理 cc-switch 失败（rc=${crc}）；可在 cc-switch 界面手动移除 apiget。"; fi
+  fi
   rm -f "$STATE_FILE" 2>/dev/null || true
-  ok "完成。（未卸载 Claude Code 本身；被注释的 shell 变量备份在 ${BACKUP_DIR}）"
+  ok "完成。（未卸载 Claude Code 本身；备份在 ${BACKUP_DIR}）"
 }
 
 # ----------------------------------------------------------------------------

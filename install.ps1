@@ -305,6 +305,7 @@ function Show-Ready($base, $model, $quota) {
 function Invoke-Uninstall {
   Info '撤销 powerkey 的配置改动…'
   $restored = $false
+  # ① settings.json：优先还原备份，否则移除 powerkey 写入的 env 键
   if (Test-Path $BackupDir) {
     $latest = Get-ChildItem (Join-Path $BackupDir 'settings.json.bak.*') -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($latest) { Copy-Item $latest.FullName $SettingsFile -Force; Ok "已还原 settings.json（来自 $($latest.Name)）。"; $restored = $true }
@@ -318,6 +319,58 @@ function Invoke-Uninstall {
       ($obj | ConvertTo-Json -Depth 20) | Set-Content -Path $SettingsFile -Encoding UTF8
       Ok '已移除 powerkey 写入的 env 键。'
     } catch {}
+  }
+  # ② ~/.claude.json：Skip-Onboarding 改过它——有备份就还原（无备份则留无害 onboarding 标记）
+  if (Test-Path $BackupDir) {
+    $cjBak = Get-ChildItem (Join-Path $BackupDir 'claude.json.bak.*') -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($cjBak) { Copy-Item $cjBak.FullName (Join-Path $HOME '.claude.json') -Force; Ok "已还原 ~/.claude.json（来自 $($cjBak.Name)）。" }
+  }
+  # ③ User 级 ANTHROPIC_* 变量：Test-ConflictingEnv 备份过原值——运行最新备份脚本还原（与 .sh 反注释 rc 行对称）
+  if (Test-Path $BackupDir) {
+    $envBak = Get-ChildItem (Join-Path $BackupDir 'anthropic-env.bak.*.ps1') -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($envBak) {
+      try { . $envBak.FullName; Ok "已还原 Test-ConflictingEnv 备份的 User 级 ANTHROPIC_* 变量（来自 $($envBak.Name)）。" }
+      catch { Warn "可手动运行 $($envBak.FullName) 还原原 ANTHROPIC_* 变量。" }
+    }
+  }
+  # ④ cc-switch（关键）：移除 apiget provider 行；若 current_provider_claude=apiget 则改回其它 claude provider（无则删键）。先备份 DB。
+  if (Test-Path $CcSwitchDb) {
+    $py = Get-Command python3 -ErrorAction SilentlyContinue; if (-not $py) { $py = Get-Command python -ErrorAction SilentlyContinue }
+    if ($py) {
+      Copy-Item $CcSwitchDb "$CcSwitchDb.powerkey-bak.$(Get-Date -Format yyyyMMddHHmmss)" -ErrorAction SilentlyContinue
+      $env:PK_DB = $CcSwitchDb; $env:PK_SET = $CcSwitchSettings
+      $script = @'
+import sqlite3, json, os
+db=os.environ["PK_DB"]; setp=os.environ["PK_SET"]
+s={}
+if os.path.exists(setp):
+    try: s=json.load(open(setp)) or {}
+    except Exception: s={}
+    if not isinstance(s,dict): s={}
+cur_is_apiget = (s.get("current_provider_claude")=="apiget")
+other=None
+con=sqlite3.connect(db, timeout=5); c=con.cursor()
+c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='providers'")
+if c.fetchone():
+    c.execute("DELETE FROM providers WHERE id='apiget' AND app_type='claude'")
+    if cur_is_apiget:
+        row=c.execute("SELECT id FROM providers WHERE app_type='claude' ORDER BY sort_index, created_at LIMIT 1").fetchone()
+        if row:
+            other=row[0]
+            c.execute("UPDATE providers SET is_current=CASE WHEN id=? THEN 1 ELSE 0 END WHERE app_type='claude'", (other,))
+    con.commit()
+con.close()
+if cur_is_apiget:
+    if other: s["current_provider_claude"]=other
+    else: s.pop("current_provider_claude", None)
+    d=os.path.dirname(setp)
+    if d: os.makedirs(d, exist_ok=True)
+    json.dump(s, open(setp,"w"), indent=2, ensure_ascii=False)
+'@
+      $script | & $py.Source -
+      if ($LASTEXITCODE -eq 0) { Ok '已从 cc-switch 移除 apiget provider（如曾设为当前则已改回其它 provider）。' }
+      else { Warn '清理 cc-switch 失败；可在 cc-switch 界面手动移除 apiget。' }
+    } else { Warn 'cc-switch 已装但无 python；跳过清理其 DB，可在 cc-switch 界面手动移除 apiget。' }
   }
   Remove-Item $StateFile -ErrorAction SilentlyContinue
   Ok '完成。（未卸载 Claude Code 本身。）'
@@ -346,6 +399,9 @@ fs.writeFileSync(p, JSON.stringify(d,null,2));
   }
   Warn '未能预置跳过首启向导（不影响使用，首次 claude 手动选一次主题/信任目录即可）。'
 }
+
+# 允许测试 dot-source 只加载函数（不执行主流程）：POWERKEY_SOURCE_ONLY=1（对齐 install.sh）
+if ($env:POWERKEY_SOURCE_ONLY -eq '1') { return }
 
 # -------- main --------
 Show-Banner
