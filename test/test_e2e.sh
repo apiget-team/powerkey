@@ -48,7 +48,8 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 PY
 python3 "$WORK/mock.py" "$PORT" & MOCK_PID=$!
-sleep 1
+# 轮询等 mock 就绪（固定 sleep 1 在慢 CI / macOS 上会 race → run1 curl 30s 超时）
+for _i in $(seq 1 40); do curl -fsS --max-time 2 -o /dev/null -X POST "http://127.0.0.1:$PORT/issue" --data '{}' 2>/dev/null && break; sleep 0.3; done
 
 echo "[run 1 — 首次安装]"
 bash "$SCRIPT_DIR/install.sh" --issuer "http://127.0.0.1:$PORT" --no-launch </dev/null >"$WORK/out1.txt" 2>&1
