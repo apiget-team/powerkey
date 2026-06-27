@@ -33,3 +33,4 @@ Thumbs.db
 # test scratch
 /tmp/
 *.log
+/server/server

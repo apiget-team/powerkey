@@ -21,6 +21,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,20 +37,25 @@ import (
 
 const quotaPerUnit = 500000 // 1 USD = 500000 quota（与 new-api common.QuotaPerUnit 对齐）
 
+const issueSecretHeader = "X-Powerkey-Secret" // 可选共享密钥头名（配合 ISSUE_SHARED_SECRET，默认关闭）
+
 // ---------------- 配置 ----------------
 
 type config struct {
-	listen        string
-	adminBase     string // apiget admin/user API base：docker 内 http://new-api:3000，或 https://api.apiget.cc
-	umbrellaToken string // 体验总账号 access_token（系统访问令牌，非网关 key）
-	umbrellaUser  string // 体验总账号 user id（New-Api-User 头）
-	publicBase    string // 回给客户端的 base_url（https://api.apiget.cc）
-	model         string // 默认试用模型
-	group         string // token 分组（""=随总账号默认）
-	quotaUSD      float64
-	fallbackURL   string
-	ratePerIPDay  int
-	storePath     string
+	listen         string
+	adminBase      string // apiget admin/user API base：docker 内 http://new-api:3000，或 https://api.apiget.cc
+	umbrellaToken  string // 体验总账号 access_token（系统访问令牌，非网关 key）
+	umbrellaUser   string // 体验总账号 user id（New-Api-User 头）
+	publicBase     string // 回给客户端的 base_url（https://api.apiget.cc）
+	model          string // 默认试用模型
+	group          string // token 分组（""=随总账号默认）
+	quotaUSD       float64
+	fallbackURL    string
+	ratePerIPDay   int
+	trustXFFDepth  int     // 受信代理层数：取 XFF 末 N 跳为真实客户端（BWH Caddy→SG 链路 = 1）；0=只用 RemoteAddr
+	minUmbrellaUSD float64 // 总账号剩余额度 < 此值(USD) 则拒铸、降级网页自助；默认 2× 试用额度
+	issueSecret    string  // 可选共享密钥（""=关闭）：开启后 /issue 必须带匹配头，挡公网直 POST
+	storePath      string
 }
 
 func env(k, def string) string {
@@ -72,6 +78,14 @@ func loadConfig() (*config, error) {
 		storePath:     env("STORE_PATH", "./issued.json"),
 		quotaUSD:      mustFloat(env("TRIAL_QUOTA_USD", "2")),
 		ratePerIPDay:  mustInt(env("RATE_LIMIT_PER_IP_PER_DAY", "20")),
+		trustXFFDepth: mustInt(env("TRUST_XFF_DEPTH", "1")),
+		issueSecret:   os.Getenv("ISSUE_SHARED_SECRET"),
+	}
+	// 总账号余额护栏阈值（USD）：默认 = 2× 试用发放额度。
+	if v := os.Getenv("MIN_UMBRELLA_QUOTA"); v != "" {
+		c.minUmbrellaUSD = mustFloat(v)
+	} else {
+		c.minUmbrellaUSD = 2 * c.quotaUSD
 	}
 	if c.umbrellaToken == "" || c.umbrellaUser == "" {
 		return nil, errors.New("UMBRELLA_ACCESS_TOKEN 和 UMBRELLA_USER_ID 必填")
@@ -276,9 +290,42 @@ func (a *app) fetchKey(id int) (string, error) {
 	return "", errors.New("GetTokenKey 未返回 key（核实返回体形状）")
 }
 
-func clientIP(r *http.Request) string {
-	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-		return strings.TrimSpace(strings.Split(xf, ",")[0])
+// umbrellaRemainingUSD 读总账号剩余额度(USD)。
+// 来源（已对源码核实）：GET {adminBase}/api/user/self —— new-api router/api-router.go
+// selfRoute GET /self → controller.GetSelf，UserAuth 接受总账号 access_token + New-Api-User
+// 双头（与本服务 adminCall 同），响应 {success,message,data:{...,"quota":<int>,...}}；data.quota
+// = user.Quota（quota 单位，quotaPerUnit/USD），且随消费递减（service/pre_consume_quota.go、
+// service/quota.go），故反映所有试用 token 的共享剩余预算。known=false=没读到可信数值。
+func (a *app) umbrellaRemainingUSD() (usd float64, known bool, err error) {
+	out, err := a.adminCall("GET", "/api/user/self", nil)
+	if err != nil {
+		return 0, false, err
+	}
+	d := dataMap(out)
+	if d == nil {
+		return 0, false, errors.New("user/self 无 data 对象")
+	}
+	q, ok := d["quota"].(float64) // JSON 数字解到 map[string]any 即 float64
+	if !ok {
+		return 0, false, errors.New("user/self data.quota 缺失或非数值")
+	}
+	return q / quotaPerUnit, true, nil
+}
+
+// clientIP 返回用于限流的可信客户端 IP。
+// trustDepth = 受信代理层数：链路是 端用户 → BWH Caddy → SG issuer，Caddy 把真实端用户作为
+// X-Forwarded-For 的「末跳」追加，故 depth=1 取 XFF 倒数第 1 个。XFF[0] 可被客户端伪造，绝不
+// 可信。depth<=0 或 XFF 跳数不足 → 退回 RemoteAddr。
+func clientIP(r *http.Request, trustDepth int) string {
+	if trustDepth > 0 {
+		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+			parts := strings.Split(xf, ",")
+			if idx := len(parts) - trustDepth; idx >= 0 && idx < len(parts) {
+				if ip := strings.TrimSpace(parts[idx]); ip != "" {
+					return ip
+				}
+			}
+		}
 	}
 	h := r.RemoteAddr
 	if i := strings.LastIndex(h, ":"); i > 0 {
@@ -300,6 +347,13 @@ func (a *app) handleIssue(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, issueResp{OK: false, Reason: "method", Message: "POST only"})
 		return
 	}
+	// 可选共享密钥闸门（ISSUE_SHARED_SECRET 未设=关闭，当前 get.apiget.cc 流程不受影响）。
+	// 开启后 /issue 必须带匹配的 X-Powerkey-Secret 头 → 挡掉绕过 Caddy 的公网直 POST。常数时间比较防时序探测。
+	if a.cfg.issueSecret != "" &&
+		subtle.ConstantTimeCompare([]byte(r.Header.Get(issueSecretHeader)), []byte(a.cfg.issueSecret)) != 1 {
+		writeJSON(w, http.StatusUnauthorized, issueResp{OK: false, Reason: "unauthorized", Message: "unauthorized"})
+		return
+	}
 	var req issueReq
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	if json.Unmarshal(body, &req) != nil || strings.TrimSpace(req.Fingerprint) == "" {
@@ -317,10 +371,22 @@ func (a *app) handleIssue(w http.ResponseWriter, r *http.Request) {
 		// 复用失败（token 可能被删）→ 落到重新铸造
 	}
 
-	// 每 IP 每日上限 → 降级网页自助
-	if !a.ipl.allow(clientIP(r), a.cfg.ratePerIPDay) {
+	// 每 IP 每日上限 → 降级网页自助（先走廉价的内存限流，再做上游余额检查）
+	if !a.ipl.allow(clientIP(r, a.cfg.trustXFFDepth), a.cfg.ratePerIPDay) {
 		writeJSON(w, http.StatusOK, issueResp{OK: false, Reason: "rate_limited", FallbackURL: a.cfg.fallbackURL,
 			Message: "今日体验额度领取已达上限，请稍后或网页自助领取。"})
+		return
+	}
+
+	// 总账号余额护栏（最高优先级）：余额耗尽时新铸的是「死 token」，且消费同账号 user.Quota 会
+	// 连带拖垮已发放的试用 → 宁可降级。**故意 fail-OPEN**：余额检查本身出错/不确定时仍照常铸码
+	// （不破坏 happy path），仅打 WARN 供监控——选这个方向是因为铸码主流程可用性优先于护栏。
+	if usd, known, err := a.umbrellaRemainingUSD(); err != nil || !known {
+		log.Printf("WARN umbrella_balance_check_failed (fail-open, minting anyway): %v", err)
+	} else if usd < a.cfg.minUmbrellaUSD {
+		log.Printf("WARN umbrella_balance_low remaining=$%.2f threshold=$%.2f — refusing mint, serving fallback", usd, a.cfg.minUmbrellaUSD)
+		writeJSON(w, http.StatusOK, issueResp{OK: false, Reason: "umbrella_exhausted", FallbackURL: a.cfg.fallbackURL,
+			Message: "体验额度暂时不可用，请网页自助领取。"})
 		return
 	}
 
@@ -379,6 +445,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/issue", a.handleIssue)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok") })
-	log.Printf("powerkey-issuer listening on %s (adminBase=%s model=%s quota=$%.0f)", cfg.listen, cfg.adminBase, cfg.model, cfg.quotaUSD)
+	log.Printf("powerkey-issuer listening on %s (adminBase=%s model=%s quota=$%.0f minUmbrella=$%.0f trustXFFDepth=%d secretGate=%v)",
+		cfg.listen, cfg.adminBase, cfg.model, cfg.quotaUSD, cfg.minUmbrellaUSD, cfg.trustXFFDepth, cfg.issueSecret != "")
 	log.Fatal(http.ListenAndServe(cfg.listen, mux))
 }
